@@ -1,0 +1,15 @@
+# Normalize source and documentation to LF in Git and on checkout.
+* text=auto
+*.ino text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.c text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.properties text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Preserve binary assets.
+*.png binary
