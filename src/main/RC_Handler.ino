@@ -5,6 +5,7 @@ void set_safe_channels()
     duty[channel] = 50;
   }
   duty[CH_SPIN_THROTTLE] = 0;
+  spin_throttle_input_percent = 0.0f;
   duty[CH_WIFI_MODE] = 0;
   duty[CH_SPIN_DIR] = 0;
   duty[CH_CONFIG_MODE] = 0;
@@ -44,6 +45,8 @@ void update_channels()
       {
         duty[channel] = constrain(map(frame[channel], 1000, 2000, 0, 100), 0, 100);
       }
+      spin_throttle_input_percent =
+          constrain((frame[CH_SPIN_THROTTLE] - 1000) * 0.1f, 0.0f, 100.0f);
       last_valid_rc_frame_ms = millis();
       rec_gap = 0;
       invalid_rc_frame_count = 0;

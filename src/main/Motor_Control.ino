@@ -32,6 +32,72 @@ int perk2dshot(int throttle)
   return min(throttle * -1, 998) + 1049;
 }
 
+int spin_requested_command(float raw_throttle_percent)
+{
+  const float endpoint = constrain(motor_full_scale_percent,
+                                   MIN_MOTOR_FULL_SCALE_PERCENT,
+                                   MAX_MOTOR_FULL_SCALE_PERCENT);
+  const float fraction = constrain(raw_throttle_percent / endpoint, 0.0f, 1.0f);
+  return (int)lroundf(fraction * 999.0f);
+}
+
+int scale_motor_output(int logical_command, RobotState state)
+{
+  logical_command = constrain(logical_command, -999, 999);
+  if(state == ROBOT_TANK)
+  {
+    return logical_command;
+  }
+  const float scale = constrain(motor_full_scale_percent,
+                                MIN_MOTOR_FULL_SCALE_PERCENT,
+                                MAX_MOTOR_FULL_SCALE_PERCENT) * 0.01f;
+  return (int)lroundf(logical_command * scale);
+}
+
+void reset_tank_boost()
+{
+  tank_boost_active = false;
+  tank_boost_sampled = false;
+  tank_boost_last_sample_ms = 0;
+}
+
+void update_tank_boost()
+{
+  if(robot_state != ROBOT_TANK || config_mode || wifi_mode_active ||
+     !rc_status || !accel_sensor_healthy || battery_critical_latched)
+  {
+    reset_tank_boost();
+    return;
+  }
+
+  const unsigned long now_ms = millis();
+  if(tank_boost_sampled &&
+     now_ms - tank_boost_last_sample_ms < TANK_BOOST_SAMPLE_INTERVAL_MS)
+  {
+    return;
+  }
+  tank_boost_last_sample_ms = now_ms;
+  tank_boost_sampled = true;
+  // Level-triggered: release restores the normal limit on the next sample.
+  tank_boost_active = duty[CH_CONFIG_SAVE] > 50;
+}
+
+void tank_drive()
+{
+  update_tank_boost();
+  const int drive_limit = tank_boost_active ? TANK_BOOST_DRIVE_LIMIT
+                                           : TANK_DRIVE_LIMIT;
+  const int steering_limit = tank_boost_active ? TANK_BOOST_STEERING_LIMIT
+                                              : TANK_STEERING_LIMIT;
+  const int steering = map(duty[CH_TRANSLATE_LR], 0, 100,
+                           steering_limit, -steering_limit);
+  // Preserve ordinary tank direction regardless of the selected spin direction.
+  motorL = constrain((int)map(duty[CH_TRANSLATE_FB], 0, 100,
+                              drive_limit, -drive_limit) + steering, -999, 999);
+  motorR = constrain((int)map(duty[CH_TRANSLATE_FB], 0, 100,
+                              -drive_limit, drive_limit) + steering, -999, 999);
+}
+
 int translation_command(int base_command, bool accelerate, float magnitude)
 {
   base_command = constrain(base_command, -999, 999);
@@ -105,10 +171,11 @@ void update_motors()
   next.target_phase_deg = wrap360(pending_target_phase_deg);
   next.heading_phase_deg = current_led_heading_phase_deg();
   // Apply the calibrated physical LED offset only to the displayed copy of
-  // the translation direction. The real motor window stays referenced to
-  // target_phase_deg and its timing is unchanged.
-  next.translation_led_phase_deg = wrap360(next.target_phase_deg +
-                                           led_heading_offset_deg);
+  // the requested translation direction. Reverse-spin compensation may use a
+  // different internal motor phase, but the displayed vector stays referenced
+  // to the field direction requested by the stick.
+  next.translation_led_phase_deg = wrap360(pending_translation_display_phase_deg +
+                                           spin_calibration[reversed].led_heading_offset_deg);
   next.estimated_rpm = max(0.0f, (float)rpm);
   next.rotation_offset = getRotationOffsetForRpm(next.estimated_rpm);
   next.reversed_spin = reversed;
@@ -277,11 +344,21 @@ void motor_output_task(void *parameter)
     // translation. The lower-priority LED task performs the blocking SPI work.
     if(control.phase_led_mode != PHASE_LED_DISABLED)
     {
-      float heading_phase_delta =
-          wrap360(rotation_phase_deg - control.heading_phase_deg);
+      // Apply the per-strip installation trims after the shared, saved heading
+      // calibration. The bottom strip's baseline remains half a revolution
+      // later because it faces the opposite side of the robot.
+      float top_heading_phase_deg =
+          wrap360(control.heading_phase_deg + top_led_phase_offset_deg);
+      float bottom_heading_phase_deg =
+          wrap360(control.heading_phase_deg + 180.0f + bottom_led_phase_offset_deg);
+      float top_heading_phase_delta =
+          wrap360(rotation_phase_deg - top_heading_phase_deg);
+      float bottom_heading_phase_delta =
+          wrap360(rotation_phase_deg - bottom_heading_phase_deg);
       float top_heading_diff =
-          min(heading_phase_delta, 360.0f - heading_phase_delta);
-      float bottom_heading_diff = fabs(heading_phase_delta - 180.0f);
+          min(top_heading_phase_delta, 360.0f - top_heading_phase_delta);
+      float bottom_heading_diff =
+          min(bottom_heading_phase_delta, 360.0f - bottom_heading_phase_delta);
       bool heading_leds_enabled = control.estimated_rpm > 400.0f;
       bool top_heading_window_active =
           heading_leds_enabled && top_heading_diff <= HEADING_LED_HALF_WIDTH_DEG;
@@ -293,9 +370,8 @@ void motor_output_task(void *parameter)
           control.reversed_spin
             ? wrap360(control.translation_led_phase_deg - rotation_phase_deg)
             : wrap360(rotation_phase_deg - control.translation_led_phase_deg);
-      float translation_led_width_deg =
-          constrain(percentdecel, MIN_PERCENT_DECEL, MAX_PERCENT_DECEL) * 3.6f;
-      float translation_led_half_width_deg = translation_led_width_deg * 0.5f;
+      const float translation_led_half_width_deg =
+          TRANSLATION_LED_ARC_WIDTH_DEG * 0.5f;
       float displayed_translation_magnitude =
           control.translation_magnitude *
           constrain(translation_scale_factor, MIN_TRANSLATION_SCALE_FACTOR,
@@ -317,7 +393,11 @@ void motor_output_task(void *parameter)
       {
         if(control.phase_led_mode == PHASE_LED_CONFIG_STABLE)
         {
-          if(top_heading_window_active)
+          if(top_heading_window_active && bottom_heading_window_active)
+          {
+            requested_frame = PHASE_LED_FRAME_CONFIG_BOTH_HEADING;
+          }
+          else if(top_heading_window_active)
           {
             requested_frame = PHASE_LED_FRAME_CONFIG_TOP_HEADING;
           }
@@ -336,7 +416,11 @@ void motor_output_task(void *parameter)
           // phase-window translation vector used in normal MELTY operation.
           // Without a translation request, retain the solid dark-red
           // calibration background so the active stage remains obvious.
-          if(top_heading_window_active)
+          if(top_heading_window_active && bottom_heading_window_active)
+          {
+            requested_frame = PHASE_LED_FRAME_BOTH_HEADING;
+          }
+          else if(top_heading_window_active)
           {
             requested_frame = directional_led_requested
                                 ? (directional_led_pulse_active
@@ -367,7 +451,11 @@ void motor_output_task(void *parameter)
         {
           // LED priority with calibrated field display: green heading,
           // then the offset-adjusted translation direction in dark red.
-          if(top_heading_window_active)
+          if(top_heading_window_active && bottom_heading_window_active)
+          {
+            requested_frame = PHASE_LED_FRAME_BOTH_HEADING;
+          }
+          else if(top_heading_window_active)
           {
             requested_frame = directional_led_pulse_active
                                 ? PHASE_LED_FRAME_TOP_HEADING_BOTTOM_MOTOR
@@ -398,6 +486,11 @@ void motor_output_task(void *parameter)
       output_l = 0;
       output_r = 0;
     }
+
+    // Tank uses its own normal/boost limits and bypasses the configured ceiling.
+    // Use the demand snapshot's state for scaling; safety still gates every mode.
+    output_l = scale_motor_output(output_l, control.state);
+    output_r = scale_motor_output(output_r, control.state);
 
     if(reverse_right_motor)
     {
@@ -534,20 +627,24 @@ void init_motor_output_task()
   }
 }
 
+int spin_acceleration_ceiling(int measured_rpm)
+{
+  // Hold the startup command up to the knee, then apply the curved rise.
+  // The coefficient changes the rise without moving the configured knee.
+  const float ramp_rpm = max((float)max(0, measured_rpm), spin_ramp_start_rpm);
+  const float ceiling = SPIN_ACCEL_MIN_COMMAND + acc_rate *
+      (powf(ramp_rpm, SPIN_ACCEL_EXPONENT) -
+       powf(spin_ramp_start_rpm, SPIN_ACCEL_EXPONENT));
+  return (int)constrain(ceiling, SPIN_ACCEL_MIN_COMMAND, 999.0f);
+}
+
 void spin()
 {
   pending_translation_enabled = false;
   pending_translation_magnitude = 0.0f;
-  if(reversed)
-  {
-    spinspeed = max(map(duty[CH_SPIN_THROTTLE], 0, 100, 0, -1000),
-                    long(-((acc_rate * rpm) + 200)));
-  }
-  else
-  {
-    spinspeed = min(map(duty[CH_SPIN_THROTTLE], 0, 100, 0, 1000),
-                    long(acc_rate * rpm) + 200);
-  }
+  const int magnitude = min(spin_requested_command(spin_throttle_input_percent),
+                            spin_acceleration_ceiling(rpm));
+  spinspeed = reversed ? -magnitude : magnitude;
   motorR = constrain(spinspeed, -999, 999);
   motorL = constrain(spinspeed, -999, 999);
 }
@@ -571,8 +668,28 @@ void translate_field_oriented()
     return;
   }
 
-  float vector_angle_deg = atan2(field_right, field_forward) * 180.0f / PI;
-  pending_target_phase_deg = wrap360(drive_heading_phase_deg + vector_angle_deg);
+  float display_vector_angle_deg =
+      atan2(field_right, field_forward) * 180.0f / PI;
+  pending_translation_display_phase_deg =
+      wrap360(drive_heading_phase_deg + display_vector_angle_deg);
+
+  float motor_forward = field_forward;
+  float motor_right = field_right;
+  if(reversed)
+  {
+    // Empirical inverse for this drivetrain's reverse-spin field mapping.
+    // The previous crossed-and-negated transform produced an exact 180-degree
+    // error (forward -> back and left -> right), so retain the axis exchange
+    // while removing both sign inversions. Keep this motor-only so the LED
+    // still shows the direction requested by the stick.
+    motor_forward = field_right;
+    motor_right = field_forward;
+  }
+
+  float motor_vector_angle_deg =
+      atan2(motor_right, motor_forward) * 180.0f / PI;
+  pending_target_phase_deg =
+      wrap360(drive_heading_phase_deg + motor_vector_angle_deg);
   pending_translation_magnitude = constrain(magnitude, 0.0f, 1.0f);
   pending_translation_enabled = true;
 }

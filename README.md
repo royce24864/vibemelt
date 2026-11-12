@@ -106,12 +106,12 @@ Check the displayed voltage against a multimeter and change this formula to matc
 | --- | --- | --- |
 | CH1 | Right stick X | Field left/right translation. In config mode, adjusts RPM correction or the LED-only phase offset according to the active calibration stage. |
 | CH2 | Right stick Y | Field forward/back translation. Forward advances the bot in the current drive-heading direction. |
-| CH3 | Left stick Y | Spin throttle. Low is off, higher spins faster. |
+| CH3 | Left stick Y | Spin throttle. Low is off; the configured full-output endpoint becomes the new 100% request. |
 | CH4 | Left stick X | Yaw/heading trim. Rotates the drive-heading frame and its calibrated LED marker left or right during normal driving. |
 | CH5 | Switch | Spin direction switch during normal operation. |
 | CH6 | Switch | WiFi/OTA mode. Must be held high for 1 second to enter. Motors are held off while active. |
 | CH7 | Switch | Config/calibration mode. Must be held high for 1 second to enter; low exits and saves. |
-| CH8 | Momentary/switch | Save button in config mode. Saves RPM correction points or current calibration values. |
+| CH8 | Momentary/switch | Hold for tank-drive boost during normal driving. In config mode, retains the calibration capture and multi-press gestures. |
 
 ## Receiver Signal Conventions
 
@@ -119,17 +119,19 @@ The receiver must send valid FlySky iBUS frames. Each of all eight channels must
 
 The firmware maps nominal 1000-2000 microseconds to an internal duty of 0-100:
 
-| Meaning | Internal duty | Approximate iBUS value |
+| Meaning | Raw duty or normalized spin request | Approximate iBUS value |
 | --- | ---: | ---: |
 | Stick/switch low | `0` | 1000 µs |
 | Center | `50` | 1500 µs |
 | Stick/switch high | `100` | 2000 µs |
 | Centered stick deadband | `43` through `57` | about 1430-1570 µs |
 | Translation becomes active | `42` or lower, or `58` or higher | outside the centered range |
-| Normal spin request | CH3 greater than `10` | above about 1100 µs |
-| Safe config/WiFi entry throttle | CH3 `5` or lower | about 1050 µs or lower |
+| Normal spin request | Normalized CH3 greater than `10%` | above about 1065 µs at the default endpoint |
+| Safe config/WiFi entry throttle | Normalized CH3 `5%` or lower | about 1032 µs or lower at the default endpoint |
 
-Switch “high” normally means duty greater than 50; low means 50 or less. CH8 save uses an edge latch: move the switch above 50 to trigger once, then below 40 before it can trigger again.
+CH3 uses `motor_full_scale_percent` as its full-output endpoint. The default is `100 × 1100 / 1700 = 64.70588%`, or about 1647 µs. From that point upward, the normalized spin request is 100%. The firmware uses the retained CH3 pulse width for this calculation rather than rounding it to integer duty first. All CH3 thresholds below, including spin selection above 10%, direction changes below 20%, and low-throttle checks at 5%, refer to this normalized request. Other channel duties, raw CH3 diagnostics, and the transmitter positions saved with RPM calibration points retain their original receiver scale.
+
+Switch “high” normally means duty greater than 50; low means 50 or less. In config mode, CH8 save uses an edge latch: move the switch above 50 to trigger once, then below 40 before it can trigger again.
 
 The current CH2 sign convention calculates field-forward directly from the centered CH2 value. With the configured EdgeTX direction, CH2 `+100` maps to duty 100 and forward, while CH2 `-100` maps to duty 0 and backward.
 
@@ -151,7 +153,7 @@ The firmware evaluates the state conditions in the following strict order. The f
 
 This gives the following normal-operation truth table:
 
-| CH3 | Estimated RPM | CH1/CH2 | Result |
+| Normalized CH3 (%) | Estimated RPM | CH1/CH2 | Result |
 | --- | ---: | --- | --- |
 | `<= 10` | Any | Both centered | `ARMED_IDLE` |
 | `<= 10` | Any | Either displaced | `TANK` |
@@ -174,44 +176,60 @@ There is no tank-mode switch. Tank mode activates whenever:
 - CH3 is at 10 or below.
 - CH1 or CH2 is outside its 8% center deadband.
 
-The ordinary tank mixer gives CH2 full forward/reverse authority and CH1 20% steering authority:
+The tank mixer uses these command ranges, with no percentage output scaling:
 
-```cpp
-left  = map(CH2, 0, 100, -100, 100)
-      + map(CH1, 0, 100,   20, -20);
-right = map(CH2, 0, 100,  100, -100)
-      + map(CH1, 0, 100,   20, -20);
-```
+| CH8 in tank drive | CH2 forward/reverse range | CH1 steering range |
+| --- | ---: | ---: |
+| Released | ±100 | ±20 |
+| Held high | ±999 | ±200 |
+
+Outside calibration, CH8 is a momentary hold-to-boost control for tank drive. Its held state is sampled every 20 ms (50 Hz); releasing it restores the ordinary ranges on the next sample. Forward/reverse and steering contributions are combined and clamped to ±999. Ordinary tank output can reach ±120 when both contributions add; full boosted output can reach physical ±999. Both ordinary and boosted tank commands bypass `motor_full_scale_percent`, including at its default 64.71% setting. In config mode, CH8 keeps its existing correction capture, stage-advance, and clear-table gestures.
 
 The state check does not require measured RPM to be zero. If the shell is still coasting and CH3 is low, moving CH1/CH2 can therefore select tank mode.
 
-There is also a high-power unstick branch: after reverse spin direction has been selected, CH2 outside 45-55 can command a full-scale counter-rotating tank output. Treat that branch as full motor power, not ordinary 20% steering.
-
 ### `SPINUP`
 
-CH3 greater than 10 selects spin-up until estimated RPM exceeds 400. CH1/CH2 do not create melty pulses in this state. The base motor demand follows CH3 but is limited by:
+A normalized spin request greater than 10% selects spin-up until estimated RPM exceeds 400. CH1/CH2 do not create melty pulses in this state. The base motor demand follows CH3 but is limited by:
 
 ```cpp
-allowed_command = acc_rate * measured_rpm + 200;
+growth = pow(max(measured_rpm, spin_ramp_start_rpm), 1.2)
+       - pow(spin_ramp_start_rpm, 1.2);
+allowed_command = int(constrain(200 + acc_rate * growth, 200, 999));
 ```
 
-This reduces the initial surge and lets the available command grow with measured RPM. Commands are clamped to ±999.
+The start-command ceiling is fixed at logical 200 and the exponent is fixed at 1.2. `spin_ramp_start_rpm` sets the knee where the ceiling begins rising above that level; its default is approximately `1003.9606 RPM`, adjustable from 0 to 5000 RPM. `acc_rate` independently sets the growth coefficient above the knee, from `0.01` to `1.00`, default `0.05`. Changing this coefficient changes the curve's steepness without moving the selected knee. Changing the knee shifts where the rise starts without changing the coefficient. The default pair reproduces the former `max(200, 0.05 × RPM^1.2)` curve before the 999 cap and integer truncation.
 
-CH5 chooses spin direction only while CH3 is below 20. CH5 above 50 selects reverse and below 50 selects normal. At exactly 50, the prior direction remains latched. Once throttle reaches 20 or higher, changing CH5 has no immediate effect.
+Requested throttle can always select a command below the ceiling, including below 200. The same base-command ceiling applies in both spin directions and while translating; translation pulses can still accelerate one motor toward full logical command. Logical commands are clamped to ±999 before the final physical output scaling. This is a command ceiling versus measured body RPM, not a prediction of acceleration over time; actual acceleration also depends on the motors, ESCs, battery, traction, and load.
+
+`motor_full_scale_percent`, shown as **Full-output throttle (%)** in the WiFi configurator, has two linked effects: it sets the raw CH3 position that becomes a 100% logical spin request, and it sets the physical output ceiling for spin, translation, and config-mode commands. Its range is `1–100%`, with a default of `64.70588%`. Their command flow is:
+
+```text
+Raw CH3 position / configured endpoint -> logical spin request, 0..999
+Logical request -> RPM acceleration ceiling -> spin/translation mixing
+Final mixed command × configured percent / 100 -> rounded physical command -> DShot
+```
+
+All mixing retains the logical ±999 range. Final spin, translation, and config-mode commands are scaled exactly once; tank commands retain the ±999 clamp and bypass that scaling. At a setting of 50%, raw CH3 at 50% requests logical 999; when the RPM ceiling permits it, the final spin command is 500. Full translation interpolates to logical 999/0, which becomes physical 500/0. At the default endpoint, full logical spin or translation output becomes physical 646 after rounding. Reaching the configured CH3 endpoint does not bypass the acceleration ceiling: low-RPM spin-up can still command less than the physical maximum.
+
+The default ratio uses 1100 KV / 1700 KV on the same 3S supply as an ideal voltage/speed scale. It does not promise equal measured motor RPM, body RPM, motor differential, or translation force. The setting leaves measured body-RPM filtering, phase timing, pulse width, and calibration values unchanged.
+
+CH5 chooses spin direction only while the normalized spin request is below 20%. CH5 above 50 selects reverse and below 50 selects normal. At exactly 50, the prior direction remains latched. Once the normalized spin request reaches 20% or higher, changing CH5 has no immediate effect.
 
 ### `MELTY`
 
-Melty state requires CH3 greater than 10 and estimated RPM greater than 400.
+Melty state requires a normalized spin request greater than 10% and estimated RPM greater than 400.
 
 - With CH1 and CH2 centered, both motors receive the normal spin command.
 - With either stick outside the deadband, the firmware computes a field vector and applies two phase-timed motor-differential pulses per revolution.
 
 The drive-heading frame can be rotated manually with CH4. Full CH4 deflection changes it at `heading_yaw_rate_dps`, currently 180 degrees per second. The displayed marker follows that frame plus the separately calibrated LED phase offset.
 
+Reverse spin applies the drivetrain's motor-phase-only inverse coordinate transform: motor forward is calculated from requested right, and motor right from requested forward. This crossed-axis mapping corrects the empirically observed reverse-spin orientation while leaving the displayed translation vector based on the original stick request.
+
 ## Normal Driving
 
 1. Start with CH3 low, CH1/CH2/CH4 centered, and CH6/CH7 low.
-2. Select spin direction with CH5 while CH3 is below 20.
+2. Select spin direction with CH5 while the normalized spin request is below 20%.
 3. Raise CH3. The robot enters `SPINUP`, then automatically changes to `MELTY` above 400 estimated RPM.
 4. Leave CH1/CH2 centered for pure spin.
 5. Move CH2 forward/back or CH1 left/right for field-oriented translation.
@@ -312,14 +330,19 @@ Most translation tuning lives near the top of `main.ino`, with the phase logic i
 
 | Variable | Default | Where | What it affects |
 | --- | --- | --- | --- |
-| `acc_rate` | `0.4` | `main.ino` | Spin-up aggressiveness and throttle ramp limiting. |
+| `motor_full_scale_percent` | `64.70588%` | NVS/WiFi config | Raw CH3 endpoint for a full logical request and final physical ceiling for spin, translation, and config output; adjustable from 1 to 100%. Tank output bypasses it. |
+| `spin_ramp_start_rpm` | `1003.9606` | NVS/WiFi config | Knee where the fixed logical-200 ceiling starts rising; adjustable from 0 to 5000 RPM independently of the growth coefficient. |
+| `acc_rate` | `0.05` | NVS/WiFi config | Growth coefficient above the selected spin-ramp knee; adjustable from 0.01 to 1.00 without moving the knee. |
 | `heading_yaw_rate_dps` | `180.0` | `main.ino` | How quickly CH4 rotates the runtime drive-heading frame during normal driving. |
 | `config_rpm_offset_rate` | `0.04` | `main.ino` | Maximum rate at which CH1 changes RPM correction; the RPM-stage stick response ramps smoothly from the deadband edge. |
 | `config_led_offset_rate_dps` | `90.0` | `main.ino` | How quickly CH1 changes LED offset while config mode CH2 is pulled back. |
 | `stick_deadzone_percent` | `8` | `main.ino` | Stick deadband around center. |
-| `percentdecel` | `15` | `main.ino` | Live angular width of each opposing translation pulse. |
-| `translation_scale_factor` | `1.0` | `main.ino` | Scales each motor's change from base throttle: 0.0 disables the differential, 0.5 halves it, and 1.0 keeps the full result. |
+| `percentdecel` | `25` | `main.ino` | Live angular width of each opposing translation pulse. |
+| `TRANSLATION_LED_ARC_WIDTH_DEG` | `54.0` | `main.ino` | Total width of each centered translation-direction LED arc in MELTY and heading calibration; independent of motor pulse width. |
+| `translation_scale_factor` | `1.0` | NVS/WiFi config | Adjustable from 0.0 to 2.0: 0.0 disables the differential, 0.5 halves it, 1.0 keeps the full result, and values above 1.0 amplify it within the motor command limits. |
 | `led_heading_offset_deg` | `315` | `main.ino` | Runtime LED-only phase offset. It starts at this default and is replaced by a valid saved NVS value at boot. |
+| `top_led_phase_offset_deg` | `0` | NVS/WiFi config | Persistent display trim added only to the top heading marker after saved calibration; adjustable from -180 to +180 degrees. |
+| `bottom_led_phase_offset_deg` | `0` | NVS/WiFi config | Persistent display trim added only to the bottom heading marker after its normal 180-degree underside orientation; adjustable from -180 to +180 degrees. |
 | `ACCEL_X_OFFSET_MM` / `ACCEL_Y_OFFSET_MM` | `8.55` / `12.30` | `main.ino` | Accelerometer die coordinates relative to the rotation center. |
 | `ACCEL_RADIUS_MM` | `14.9797` | `main.ino` | Radial distance derived from the X/Y mounting coordinates and used for RPM calculation. |
 | `rpm_g_per_rpm2_per_mm` | `0.000001118` | `main.ino` | Centripetal acceleration conversion constant for radius in millimeters. |
@@ -329,7 +352,7 @@ Most translation tuning lives near the top of `main.ino`, with the phase logic i
 
 If translation is too weak or the bot barely walks:
 
-- Increase `translation_scale_factor` toward `1.0` or use more translation-stick displacement.
+- Increase `translation_scale_factor` within its `0.0–2.0` range or use more translation-stick displacement. Values above `1.0` amplify the pulse difference until a motor command reaches its limit.
 - Increase `percentdecel` slightly to widen the square pulse.
 - Make sure RPM correction points are saved across the RPM range you actually drive.
 - Check that the bot has enough spin speed before expecting strong translation.
@@ -399,11 +422,13 @@ slow_output     = base_spin * (1 - scaled_change);
 fast_output     = base_spin + (same_sign_limit - base_spin) * scaled_change;
 ```
 
-At `percentdecel = 15`, each live angular window is 54 degrees wide. The windows begin at the field-vector target phase and target phase + 180 degrees. While phase remains inside a window, the mapping moves one motor toward full command and the other toward zero, scaled by `translation_scale_factor` (default `0.60`). Outside both windows, both motors immediately return to the base spin command. Phase is evaluated at 2 kHz and the resulting commands are transmitted at the existing 1 kHz DShot rate.
+At the default `percentdecel = 25`, each live angular window is 90 degrees wide. The windows begin at the field-vector target phase and target phase + 180 degrees. While phase remains inside a window, the mapping moves one motor toward full command and the other toward zero, scaled by `translation_scale_factor` (range `0.0–2.0`, default `1.0`). Outside both windows, both motors immediately return to the base spin command. Phase is evaluated at 2 kHz and the resulting commands are transmitted at the existing 1 kHz DShot rate.
 
-Translation pulses require estimated RPM above 400 even if the main loop has requested translation. At full stick, the interpolation commands one motor to zero and the other to `999` in normal spin or `-999` in reversed spin. Half a revolution later, the motors swap roles. Partial stick interpolates each motor between its base command and those endpoints.
+The dark-red translation-direction LEDs use separate fixed 54-degree arcs: ±27 degrees centered on the requested direction and its opposite. `TRANSLATION_LED_ARC_WIDTH_DEG` sets this display width in both MELTY operation and heading calibration. Changing `percentdecel` changes only the motor pulses; their default remains 25% of a rotation, or 90 degrees per pulse.
 
-An explicit sign-preservation guard clamps every translated output between zero and the full-scale endpoint matching its base command. Translation can slow a motor to zero but cannot command it into reverse. `translation_scale_factor` multiplies each motor's difference from base after stick scaling, while `percentdecel` controls pulse duration. For example, if the unscaled pulse changes a base of 600 into 800/400, a factor of 0.5 produces 700/500.
+Translation pulses require estimated RPM above 400 even if the main loop has requested translation. At full stick with the default scale factor of `1.0`, the interpolation commands one motor to logical zero and the other to `999` in normal spin or `-999` in reversed spin. The final output scaling turns these into physical 0/646 at the default `motor_full_scale_percent`, or 0/500 at a 50% setting. Half a revolution later, the motors swap roles. Partial stick interpolates each motor between its logical base command and those endpoints before the single final scaling step.
+
+An explicit sign-preservation guard clamps every translated output between zero and the full-scale endpoint matching its base command. Translation can slow a motor to zero but cannot command it into reverse. `translation_scale_factor` multiplies each motor's difference from base after stick scaling, while `percentdecel` controls pulse duration. Values above `1.0` amplify that difference, subject to the same command clamps. For example, if the unscaled pulse changes a base of 600 into 800/400, a factor of 0.5 produces 700/500, while a factor of 2.0 produces 999/200 after clamping.
 
 ### RPM Estimator
 
@@ -448,7 +473,7 @@ This is an open-loop heading estimate based on measured speed. There is no magne
 - The accelerometer range is ±400 g per axis. With the current 8.55/12.30 mm placement, the Y component reaches mathematical full scale at about 5,393 RPM. The firmware does not stop or gate the motors when an axis clips; the reported RPM instead plateaus or becomes inaccurate, so heading and translation timing are no longer trustworthy above the measurement range.
 - At 6,000 RPM the shell would turn 100 times per second. The 2 kHz phase task provides about 20 phase decisions per revolution, while the 1 kHz DShot stream publishes about 10 motor updates per revolution.
 - The 400 Hz estimator provides about four new accelerometer estimates per revolution at 6,000 RPM. The 2 kHz phase task continues between samples using the latest filtered RPM.
-- DShot commands are limited to `-999` through `999`. translation interpolation stays between zero and the base command's same-direction full-scale endpoint.
+- Logical motor commands are limited to `-999` through `999`. For spin, translation, and config output, the final physical ceiling is `round(999 × motor_full_scale_percent / 100)`, currently 646 by default. Tank output retains the full ±999 limit. Translation interpolation stays between zero and the base command's same-direction logical full-scale endpoint before scaling.
 - Firmware timing cannot overcome mechanical limits such as motor torque, wheel slip, shell inertia, battery sag, ESC response, accelerometer clipping, or vibration. Verify measured RPM and translation behavior before increasing speed.
 
 ## WiFi Mode
@@ -492,21 +517,33 @@ Local routes:
 - `/api/timeline.csv` complete retained FIFO download
 - `/api/melty.csv` MELTY-only subset
 - `/api/events.txt` captured event/debug messages, including explicit accelerometer `LOSS` and `RECOVERY` records with cause, sample age/RPM at loss, recovery downtime, and phase-reset status
-- `/api/config.json` current/default drive configuration
-- `POST /api/config` save one drive setting
-- `POST /api/config/reset` reset one drive setting to its firmware default
+- `/api/config.json` current/default drive and LED configuration
+- `POST /api/config` save one drive or LED setting
+- `POST /api/config/reset` reset one drive or LED setting to its firmware default
 
 The DShot error statistic is the ESP32 DShot TX API error count. It reports local RMT/API failures, not acknowledgment that an ESC received or acted on a command.
 
 ### WiFi drive configurator
 
-The dashboard loads the drive configurator before the larger diagnostic responses. It can change three persistent drive settings while the controller is safely stopped in WiFi mode. Each setting has its own Save and Reset-to-default button. Save requests are range-checked, written to NVS, read back for verification, and rejected outside the WiFi safety state.
+The dashboard loads the configurator before the larger diagnostic responses. It can change seven persistent drive and LED settings while the controller is safely stopped in WiFi mode. Each setting has its own Save and Reset-to-default button. Save requests are range-checked, written to NVS, read back for verification, and rejected outside the WiFi safety state.
 
-- `translation_scale_factor`: `0.00–1.00`, default `0.60`. Scales the difference between the base spin command and the translation-pulse command. Zero disables translation modulation; one applies the full difference.
-- `percentdecel`: `1–50%`, default `15%`. Sets the live angular width of each opposing translation pulse. Larger values apply the impulse longer but can increase braking, current, ESC stress, and motor heat.
-- `acc_rate`: `0.20–1.00`, default `0.40`. Sets the RPM-dependent acceleration-ceiling slope: `maximum DShot = 200 + acc_rate × RPM`. Lower values ramp more gently; higher values reach requested throttle sooner.
+- `motor_full_scale_percent` (**Full-output throttle (%)**): `1–100%`, default `64.70588%`. Sets both the raw spin-throttle endpoint that means logical 100% and the physical output ceiling after spin, translation, or config mixing. Full translation still reaches that ceiling with the opposite motor at zero. The RPM acceleration ceiling remains active. Ordinary and boosted tank output bypass this percentage.
+- `translation_scale_factor`: `0.00–2.00`, default `1.00`. Scales the difference between the base spin command and the translation-pulse command. Zero disables translation modulation; one applies the full difference; values above one amplify it, with motor commands clamped between zero and the same-direction full-scale limit.
+- `percentdecel`: `1–50%`, default `25%`. Sets the live angular width of each opposing translation pulse. Larger values apply the impulse longer but can increase braking, current, ESC stress, and motor heat.
+- `spin_ramp_start_rpm`: `0–5000 RPM`, default approximately `1003.9606 RPM`. Sets where the logical command ceiling starts rising above its fixed 200 level. It can move independently of the growth coefficient.
+- `acc_rate`: `0.01–1.00`, default `0.05`, adjustable in steps of `0.01`. Multiplies the `RPM^1.2` growth above the selected knee; a higher value makes that part of the ceiling steeper without moving the knee. The formula is `int(clamp(200 + acc_rate × (max(RPM, knee)^1.2 − knee^1.2), 200, 999))`.
+- `top_led_phase_offset_deg`: `-180–+180°`, default `0°`. Adds a display-only phase trim to the top heading marker after the shared saved LED calibration.
+- `bottom_led_phase_offset_deg`: `-180–+180°`, default `0°`. Adds a display-only phase trim to the bottom heading marker after its normal 180-degree underside orientation.
+
+The spin-curve graph is a self-contained SVG served by the controller and works without an internet connection. Its axes stay fixed at 0–5000 body RPM and 0–1000 logical command. The dotted reference is the firmware-default curve; the solid curve previews the edited knee and coefficient as inputs change. Previewing does not change motor commands. Save persists a setting to the controller; until then, edits are an unsaved graph preview. The graph shows the logical acceleration ceiling for a full normalized spin request, before the final `motor_full_scale_percent` scaling; at the default 64.71% scale, logical 999 becomes physical 646.
 
 Saved values are stored in the `vibemelt` NVS namespace and load at boot. Resetting a setting stores its firmware default. Configuration storage is separate from the volatile session telemetry, which remains RAM-only.
+
+The full-output setting uses the NVS key `motor_full_pct`. A missing saved value loads the new default; later Save or Reset changes persist across reboots. Adding or changing this setting does not clear accelerometer zero, RPM correction points, or LED calibration.
+
+The spin-ramp knee uses the NVS key `ramp_start_rpm`. When that key is missing, the firmware seeds the knee with `pow(200 / saved_acc_rate, 1 / 1.2)` so an existing valid saved coefficient keeps its legacy spin-ceiling curve. With the default coefficient, this gives approximately 1003.9606 RPM. Subsequent knee and coefficient changes persist independently. This addition preserves accelerometer, RPM, and LED calibration, full-output scaling, translation pulse width, and the separate LED arc width.
+
+On the first boot after this tuning upgrade, the `drive_tune_v` migration installs `acc_rate = 0.05` and `percentdecel = 25` once. Accelerometer, RPM, and LED calibration are preserved. Later changes saved through the web UI load normally on subsequent boots.
 
 When upgrading from firmware that used a different NVS namespace, saved settings are not imported. Recalibrate the accelerometer, RPM correction table, and LED heading offset, and reapply any custom drive settings after flashing.
 
@@ -531,7 +568,7 @@ LED feedback:
 - White at startup: boot/setup.
 - Red/orange bar while stopped: battery-level display.
 - Green/cyan at the field heading: heading indication; orange replaces it during a battery warning.
-- Dim red while a translation pulse is active: motor-pulse indication.
+- Dim red in the centered 54-degree arcs: translation-direction indication.
 
 Tank and spin-up do not have dedicated unique state colors. Enable serial debug when the exact selected state needs to be observed.
 
@@ -539,7 +576,7 @@ Tank and spin-up do not have dedicated unique state colors. Enable serial debug 
 
 Motor output and phase accumulation run in a dedicated task released every 500 microseconds by `esp_timer` (2 kHz). DShot packets are published every other task iteration (1 kHz), matching PotatoMelt-ESP32 while preserving the finer phase decisions. The normal Arduino loop publishes an atomic snapshot containing state, base throttle, filtered RPM, correction factor, and requested translation vector. LED rendering, RC parsing, sensor reads, NVS writes, and WiFi servicing cannot directly stretch a translation pulse.
 
-MELTY phase lighting follows priority: the top strip's calibrated ±10-degree heading window is green, the upside-down strip's teal-green heading window is exactly 180 degrees later, the offset-adjusted copy of the translation-direction windows is dark red, and each strip is off outside its applicable windows. The displayed red windows are centered on the requested field vector, so the applicable heading marker bisects a forward window and takes color priority on that strip. This centering is display-only: the real motor windows retain their original leading-edge timing. `led_heading_offset_deg` rotates both heading windows and the red display copy together without changing the real field-vector motor target or motor timing. LED frames are coalesced and written by a separate priority-2 task using uninterrupted SPI DMA transfers, below the priority-4 motor scheduler. The priority-4 task only evaluates the small phase comparisons and sends a non-blocking task notification; all LED encoding and SPI output stays in the lower-priority task. The DMA transfer prevents the eighth LED from receiving a late split frame.
+MELTY phase lighting follows priority: the top strip's calibrated ±10-degree heading window is green, the upside-down strip's teal-green heading window starts 180 degrees later, the offset-adjusted copy of the translation-direction windows is dark red, and each strip is off outside its applicable windows. `top_led_phase_offset_deg` and `bottom_led_phase_offset_deg` then trim the two heading markers independently; if their windows overlap, both strips retain their heading colors. The displayed red windows are centered on the requested field vector, so the applicable heading marker bisects a forward window and takes color priority on that strip. This centering is display-only: the real motor windows retain their original leading-edge timing. `led_heading_offset_deg` rotates both heading windows and the red display copy together without changing the real field-vector motor target or motor timing. The per-strip trims affect only their heading markers. LED frames are coalesced and written by a separate priority-2 task using uninterrupted SPI DMA transfers, below the priority-4 motor scheduler. The priority-4 task only evaluates the small phase comparisons and sends a non-blocking task notification; all LED encoding and SPI output stays in the lower-priority task. The DMA transfer prevents the eighth LED from receiving a late split frame.
 
 The H3LIS331DL is configured for a 1 kHz output data rate. RPM estimation reads it at 400 Hz, projects X/Y acceleration onto the known 8.55/12.30 mm radial mounting vector, applies a median-of-three filter followed by a 0.4084-alpha exponential low-pass filter, and advances phase by integrating corrected RPM over elapsed time. With the configured ±400 g range, the Y axis reaches full scale at approximately 5,393 RPM for this mounting geometry. Axis clipping is accepted as data and does not stop motor output.
 

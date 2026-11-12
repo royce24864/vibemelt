@@ -160,6 +160,11 @@ void render_phase_led_frame(PhaseLedFrame frame)
       fill_bottom_heading_color();
       break;
 
+    case PHASE_LED_FRAME_BOTH_HEADING:
+      fill_top_heading_color();
+      fill_bottom_heading_color();
+      break;
+
     case PHASE_LED_FRAME_TOP_HEADING_BOTTOM_MOTOR:
       fill_top_heading_color();
       bottom_strip.fill(bottom_strip.Color(80, 0, 0), 0, NUMPIXELSB);
@@ -177,6 +182,11 @@ void render_phase_led_frame(PhaseLedFrame frame)
 
     case PHASE_LED_FRAME_CONFIG_BOTTOM_HEADING:
       top_strip.fill(top_strip.Color(0, 180, 0), 0, NUMPIXELST);
+      bottom_strip.fill(bottom_strip.Color(255, 60, 0), 0, NUMPIXELSB);
+      break;
+
+    case PHASE_LED_FRAME_CONFIG_BOTH_HEADING:
+      top_strip.fill(top_strip.Color(255, 60, 0), 0, NUMPIXELST);
       bottom_strip.fill(bottom_strip.Color(255, 60, 0), 0, NUMPIXELSB);
       break;
 
@@ -204,10 +214,12 @@ bool phase_led_frame_contains_heading(PhaseLedFrame frame)
 {
   return frame == PHASE_LED_FRAME_TOP_HEADING ||
          frame == PHASE_LED_FRAME_BOTTOM_HEADING ||
+         frame == PHASE_LED_FRAME_BOTH_HEADING ||
          frame == PHASE_LED_FRAME_TOP_HEADING_BOTTOM_MOTOR ||
          frame == PHASE_LED_FRAME_MOTOR_TOP_BOTTOM_HEADING ||
          frame == PHASE_LED_FRAME_CONFIG_TOP_HEADING ||
-         frame == PHASE_LED_FRAME_CONFIG_BOTTOM_HEADING;
+         frame == PHASE_LED_FRAME_CONFIG_BOTTOM_HEADING ||
+         frame == PHASE_LED_FRAME_CONFIG_BOTH_HEADING;
 }
 
 void phase_led_output_task(void *parameter)

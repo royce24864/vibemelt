@@ -17,6 +17,7 @@
 #include "DShotRMT.h"
 #include <Preferences.h>
 #include "Session_Logger.h"
+#include "Spin_Calibration.h"
 
 // Compile with -DENABLE_SERIAL_DEBUG to enable
 // transition/event logging at 115200 baud. Serial is never used by the 2 kHz
@@ -35,6 +36,7 @@ void session_web_register_routes();
 void reset_loop_task_watchdog();
 void suspend_loop_task_watchdog_for_wifi();
 void resume_loop_task_watchdog_after_wifi();
+void reset_tank_boost();
 
 
 //#define ENABLE_SERIAL_DEBUG
@@ -87,6 +89,17 @@ const int NUMPIXELSB = 8; //number of leds in the bottom strip
 const bool rvs_led_T = false;
 const bool rvs_led_B = false;
 const float HEADING_LED_HALF_WIDTH_DEG = 10.0f;
+// Display-only arc width; independent of the motor translation pulse setting.
+constexpr float TRANSLATION_LED_ARC_WIDTH_DEG = 54.0f;
+constexpr float DEFAULT_TOP_LED_PHASE_OFFSET_DEG = 0.0f;
+constexpr float DEFAULT_BOTTOM_LED_PHASE_OFFSET_DEG = 0.0f;
+constexpr float MIN_LED_PHASE_OFFSET_DEG = -180.0f;
+constexpr float MAX_LED_PHASE_OFFSET_DEG = 180.0f;
+// Persistent per-strip display-only trims applied after the saved LED heading calibration.
+// The bottom marker already has its physical 180-degree orientation applied in
+// Motor_Control.ino. These values do not alter motor or translation timing.
+float top_led_phase_offset_deg = DEFAULT_TOP_LED_PHASE_OFFSET_DEG;
+float bottom_led_phase_offset_deg = DEFAULT_BOTTOM_LED_PHASE_OFFSET_DEG;
 Adafruit_NeoPixel top_strip(NUMPIXELST, top_led_pin, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel bottom_strip(NUMPIXELSB, bottom_led_pin, NEO_GRB + NEO_KHZ800);
 const int animSpeed = 100;   // ms between LED updates when in animation mode
@@ -104,19 +117,40 @@ const int CH_HEADING_YAW = 4;      // left/right stick: rotate the runtime drive
 const int CH_SPIN_DIR = 5;         // spin direction switch
 const int CH_WIFI_MODE = 6;        // WiFi/OTA mode switch
 const int CH_CONFIG_MODE = 7;      // config/calibration mode switch
-const int CH_CONFIG_SAVE = 8;      // capture RPM point; triple press advances to heading calibration
+const int CH_CONFIG_SAVE = 8;      // calibration capture/gestures; hold for tank-drive boost otherwise
 
 //------Driving characteristcs------
-constexpr float DEFAULT_ACC_RATE = 0.40f;
-constexpr float MIN_ACC_RATE = 0.20f;
+constexpr unsigned long TANK_BOOST_SAMPLE_INTERVAL_MS = 20; // 50 Hz, only in tank mode
+constexpr int TANK_DRIVE_LIMIT = 100;
+constexpr int TANK_STEERING_LIMIT = 20;
+constexpr int TANK_BOOST_DRIVE_LIMIT = 999;
+constexpr int TANK_BOOST_STEERING_LIMIT = 200;
+constexpr float DEFAULT_ACC_RATE = 0.05f;
+constexpr float MIN_ACC_RATE = 0.01f;
 constexpr float MAX_ACC_RATE = 1.00f;
-constexpr float DEFAULT_PERCENT_DECEL = 15.0f;
+constexpr float SPIN_ACCEL_MIN_COMMAND = 200.0f;
+constexpr float SPIN_ACCEL_EXPONENT = 1.2f;
+// At the default coefficient, this knee preserves the original spin-up curve.
+constexpr float DEFAULT_SPIN_RAMP_START_RPM = 1003.9606f;
+constexpr float MIN_SPIN_RAMP_START_RPM = 0.0f;
+constexpr float MAX_SPIN_RAMP_START_RPM = 5000.0f;
+constexpr float DEFAULT_PERCENT_DECEL = 25.0f;
 constexpr float MIN_PERCENT_DECEL = 1.0f;
 constexpr float MAX_PERCENT_DECEL = 50.0f;
+// Reset only drive tuning once when migrating from the former linear curve.
+constexpr int DRIVE_TUNING_VERSION = 1;
 constexpr float DEFAULT_TRANSLATION_SCALE_FACTOR = 1.0f;
 constexpr float MIN_TRANSLATION_SCALE_FACTOR = 0.0f;
 constexpr float MAX_TRANSLATION_SCALE_FACTOR = 2.0f;
-float acc_rate = DEFAULT_ACC_RATE; //RPM-based spin acceleration ceiling slope
+// Same-voltage speed scaling for the reference 1100 kV and this 1700 kV motor.
+// This percentage defines both the raw spin-input endpoint and the physical
+// output represented by logical full scale (999), except in tank drive.
+constexpr float DEFAULT_MOTOR_FULL_SCALE_PERCENT = 100.0f * 1100.0f / 1700.0f;
+constexpr float MIN_MOTOR_FULL_SCALE_PERCENT = 1.0f;
+constexpr float MAX_MOTOR_FULL_SCALE_PERCENT = 100.0f;
+float motor_full_scale_percent = DEFAULT_MOTOR_FULL_SCALE_PERCENT;
+float acc_rate = DEFAULT_ACC_RATE; //rise coefficient after the independently configured RPM knee
+float spin_ramp_start_rpm = DEFAULT_SPIN_RAMP_START_RPM;
 const float heading_yaw_rate_dps = 180.0; //max manual LED heading rotation speed, degrees/second
 const float config_rpm_offset_rate = 0.04; //rotation-period correction factor change per second at full CH1 stick
 const float config_led_offset_rate_dps = 90.0; //LED heading offset change per second at full yaw stick
@@ -124,7 +158,7 @@ const unsigned long config_stage_advance_window_ms = 3000;
 const int config_stage_advance_press_count = 3;
 const int config_clear_press_count = 5;
 const int stick_deadzone_percent = 8;
-const int throttle_low_percent = 5; //throttle stick low is ~-100, which maps to duty near 0
+const int throttle_low_percent = 5; //percentage of the configured logical spin range
 float percentdecel = DEFAULT_PERCENT_DECEL; //live angular width of each translation pulse
 float translation_scale_factor = DEFAULT_TRANSLATION_SCALE_FACTOR; //0=no pulse change, 1=full change
 const unsigned long mode_switch_hold_ms = 1000; //CH6/CH7 must be high this long before entering special modes
@@ -147,7 +181,7 @@ const int ACCEL_READ_FAILURE_LIMIT = 5;
 const unsigned long RPM_STABLE_HOLD_MS = 750;
 const int BATTERY_CELL_COUNT = 3; //0 auto-detects 3S/4S; set explicitly when the pack is fixed
 const float BATTERY_WARN_VOLTS_PER_CELL = 3.60;
-const float BATTERY_HALT_VOLTS_PER_CELL = 3.20;
+const float BATTERY_HALT_VOLTS_PER_CELL = 3.10;
 const float BATTERY_BAR_3S_FULL_VOLTS = 13.05; //fully charged 3S LiHV pack
 const float BATTERY_BAR_STANDARD_FULL_VOLTS_PER_CELL = 4.20;
 const float BATTERY_UNPLUGGED_THRESHOLD = 5.5;
@@ -164,7 +198,6 @@ const float rpm_g_per_rpm2_per_mm = 0.000001118; //g-force per rpm^2 per mm of a
 const float rpm_per_sqrt_g =
     1.0f / sqrt(rpm_g_per_rpm2_per_mm * ACCEL_RADIUS_MM);
 const int WDT_TIMEOUT = 1;  // seconds
-const int MAX_CORRECTION_POINTS = 8;
 const char *NVS_NAMESPACE = "vibemelt";
 
 enum RobotState
@@ -194,10 +227,12 @@ enum PhaseLedFrame : uint8_t
   PHASE_LED_FRAME_OFF,
   PHASE_LED_FRAME_TOP_HEADING,
   PHASE_LED_FRAME_BOTTOM_HEADING,
+  PHASE_LED_FRAME_BOTH_HEADING,
   PHASE_LED_FRAME_TOP_HEADING_BOTTOM_MOTOR,
   PHASE_LED_FRAME_MOTOR_TOP_BOTTOM_HEADING,
   PHASE_LED_FRAME_CONFIG_TOP_HEADING,
   PHASE_LED_FRAME_CONFIG_BOTTOM_HEADING,
+  PHASE_LED_FRAME_CONFIG_BOTH_HEADING,
   PHASE_LED_FRAME_CONFIG_STABLE,
   PHASE_LED_FRAME_MOTOR_ON
 };
@@ -247,13 +282,11 @@ volatile uint32_t phase_led_render_count = 0;
 Preferences config_store;
 //-------rpm and heading calc--------
 int rpm;
-float offset = 1.0; //creates variable to tune a stable heading, will update from NVS in setup
 volatile int angle = 0; //phase accumulator maintained by the fixed-rate motor task
 // Keep the commanded drive frame separate from the physical LED phase offset.
 // CH4 rotates the drive frame at runtime; heading calibration changes only the
 // LED offset so the marker can be aligned to the direction the bot actually moves.
 float drive_heading_phase_deg = 0.0f;
-float led_heading_offset_deg = 315.0f; //default LED-only offset; replaced by a valid saved value at boot
 unsigned long last_heading_update_ms = 0;
 unsigned long last_config_adjust_ms = 0;
 float accel_zero_x_g_offset = 0.0;
@@ -272,20 +305,22 @@ bool current_gforce_valid = false;
 uint32_t accel_sample_sequence = 0;
 bool reset_accel_filter_requested = false;
 volatile bool reset_rotation_phase_requested = false;
-int correction_point_count = 0;
-float correction_rpm[MAX_CORRECTION_POINTS];
-float correction_offset[MAX_CORRECTION_POINTS];
-int correction_throttle[MAX_CORRECTION_POINTS];
 int max_rpm = 0;  // stores the greatest rpm achieved
 int max_gforce = 0; //for storing max gforce achieved
 //--------translation----------
 bool reversed = false;  //used for reverse spin direction
+SpinCalibration spin_calibration[2]; //0 = normal, 1 = reverse
 int64_t loopstart = 0; //stores last gforce read time in microseconds
 int motorL;
 int motorR;
 int spinspeed;
+bool tank_boost_active = false;
+bool tank_boost_sampled = false;
+unsigned long tank_boost_last_sample_ms = 0;
 //--------reciever----------
 int duty[NUM_CHANNELS + 1]; //1-indexed list values from 0 - 100
+// Keep 0.1% receiver precision so a 64.7% endpoint is not truncated to 64%.
+float spin_throttle_input_percent = 0.0f;
 int last_rec; //used to store update times for detecting signal loss
 unsigned long rec_gap;
 volatile bool rc_status = false; //whether getting rc signal, used for triggering failsafe
@@ -324,6 +359,7 @@ RobotState last_operating_state = ROBOT_FAILSAFE;
 bool pending_translation_enabled = false;
 float pending_translation_magnitude = 0.0f;
 float pending_target_phase_deg = 0.0f;
+float pending_translation_display_phase_deg = 0.0f;
 bool loop_task_watchdog_registered = false;
 
 const char *robot_state_name(int state)
@@ -346,6 +382,10 @@ const char *robot_state_name(int state)
 void set_robot_state(int next_state_value)
 {
   RobotState next_state = (RobotState)next_state_value;
+  if(next_state != ROBOT_TANK)
+  {
+    reset_tank_boost();
+  }
   if(robot_state != next_state)
   {
     if(next_state == ROBOT_WIFI && robot_state != ROBOT_WIFI)
@@ -401,6 +441,7 @@ void resume_loop_task_watchdog_after_wifi()
 //--------------------------------------------------------------------------------------------
 void setup() 
 {
+  SpinCalibration &calibration = spin_calibration[reversed];
   session_logger_begin();
   DEBUG_SERIAL_BEGIN();
   DEBUG_LOG("boot: setup started");
@@ -408,23 +449,27 @@ void setup()
   config_store.begin(NVS_NAMESPACE, false);
   load_config_settings();
   DEBUG_LOGF("config loaded: led_offset=%.1f drive_heading=%.1f rpm_offset=%.4f correction_points=%d",
-             led_heading_offset_deg, drive_heading_phase_deg, offset,
-             correction_point_count);
+             calibration.led_heading_offset_deg, drive_heading_phase_deg, calibration.offset,
+             calibration.correction_point_count);
   DEBUG_LOGF("drive config loaded: translation_scale=%.2f pulse_width=%.1f%% acc_rate=%.2f",
              translation_scale_factor, percentdecel, acc_rate);
+  DEBUG_LOGF("spin ramp: start=%.1f RPM floor=%.0f exponent=%.1f",
+             spin_ramp_start_rpm, SPIN_ACCEL_MIN_COMMAND, SPIN_ACCEL_EXPONENT);
+  DEBUG_LOGF("motor full scale: raw spin endpoint=%.2f%% spin/config ceiling=%d/999",
+             motor_full_scale_percent, scale_motor_output(999, ROBOT_SPINUP));
 #ifdef ENABLE_SERIAL_DEBUG
   session_logger_delay(1500); // Allow the serial monitor to reconnect before table output.
 #endif
-  if(correction_point_count == 0)
+  if(calibration.correction_point_count == 0)
   {
     DEBUG_LOG("config table: empty");
   }
   else
   {
-    for(int i = 0; i < correction_point_count; i++)
+    for(int i = 0; i < calibration.correction_point_count; i++)
     {
       DEBUG_LOGF("config table[%d]: rpm=%.0f offset=%.4f throttle=%d",
-                 i, correction_rpm[i], correction_offset[i], correction_throttle[i]);
+                 i, calibration.correction_rpm[i], calibration.correction_offset[i], calibration.correction_throttle[i]);
     }
   }
   Wire.begin(D4, D5);  // XIAO ESP32-C3 D4/SDA/GPIO6 and D5/SCL/GPIO7
@@ -642,11 +687,11 @@ void update_robot_state()
   {
     set_robot_state(ROBOT_CONFIG);
   }
-  else if(rpm > 400 && duty[CH_SPIN_THROTTLE] > 10)
+  else if(rpm > 400 && spin_requested_command(spin_throttle_input_percent) > 100)
   {
     set_robot_state(ROBOT_MELTY);
   }
-  else if(duty[CH_SPIN_THROTTLE] > 10)
+  else if(spin_requested_command(spin_throttle_input_percent) > 100)
   {
     set_robot_state(ROBOT_SPINUP);
   }
@@ -705,7 +750,7 @@ bool config_entry_controls_safe()
   // Do not gate accelerometer calibration on the RPM estimate. Before the
   // first successful zero, sensor offset can make a stationary robot appear
   // to be spinning and would make config mode impossible to enter.
-  return duty[CH_SPIN_THROTTLE] <= throttle_low_percent &&
+  return spin_requested_command(spin_throttle_input_percent) <= throttle_low_percent * 10 &&
          stick_percent_centered(CH_TRANSLATE_LR) == 0 &&
          stick_percent_centered(CH_TRANSLATE_FB) == 0 &&
          stick_percent_centered(CH_HEADING_YAW) == 0 &&
@@ -714,7 +759,7 @@ bool config_entry_controls_safe()
 
 bool motors_are_off()
 {
-  return duty[CH_SPIN_THROTTLE] <= throttle_low_percent &&
+  return spin_requested_command(spin_throttle_input_percent) <= throttle_low_percent * 10 &&
          motorL == 0 &&
          motorR == 0 &&
          motor_on == false &&
@@ -733,28 +778,18 @@ void show_led_feedback(String status, unsigned long duration_ms, int count = 0,
 
 void save_config_settings()
 {
-  sortCorrectionTable();
-  config_store.putFloat("rpm_offset", offset);
-  // Keep the existing NVS key for compatibility with previously saved values.
-  config_store.putFloat("led_heading", led_heading_offset_deg);
+  // Keep legacy keys for normal spin and separate reverse values with r_.
+  save_spin_calibration(spin_calibration[0], "");
+  save_spin_calibration(spin_calibration[1], "r_");
   config_store.putFloat("accel_zero_x", accel_zero_x_g_offset);
   config_store.putFloat("accel_zero_y", accel_zero_y_g_offset);
   config_store.putFloat("acc_rate", acc_rate);
+  config_store.putFloat("ramp_start_rpm", spin_ramp_start_rpm);
   config_store.putFloat("pulse_pct", percentdecel);
   config_store.putFloat("trans_scale", translation_scale_factor);
-  config_store.putInt("corr_count", correction_point_count);
-  for(int i = 0; i < MAX_CORRECTION_POINTS; i++)
-  {
-    char rpm_key[8];
-    char offset_key[8];
-    char throttle_key[8];
-    snprintf(rpm_key, sizeof(rpm_key), "rpm%d", i);
-    snprintf(offset_key, sizeof(offset_key), "off%d", i);
-    snprintf(throttle_key, sizeof(throttle_key), "thr%d", i);
-    config_store.putFloat(rpm_key, correction_rpm[i]);
-    config_store.putFloat(offset_key, correction_offset[i]);
-    config_store.putInt(throttle_key, correction_throttle[i]);
-  }
+  config_store.putFloat("motor_full_pct", motor_full_scale_percent);
+  config_store.putFloat("top_led_trim", top_led_phase_offset_deg);
+  config_store.putFloat("bot_led_trim", bottom_led_phase_offset_deg);
 }
 
 void enter_config_mode()
@@ -762,7 +797,8 @@ void enter_config_mode()
   config_mode = true;
   config_calibration_stage = CONFIG_STAGE_RPM;
   set_robot_state(ROBOT_CONFIG);
-  DEBUG_LOG("config: entering; accelerometer zero starting");
+  DEBUG_LOGF("config: entering %s spin calibration; accelerometer zero starting",
+             reversed ? "REVERSE" : "NORMAL");
   config_save_latched = false;
   config_stage_press_count = 0;
   config_stage_press_start_ms = 0;
@@ -780,9 +816,10 @@ void enter_config_mode()
 
 void exit_config_mode()
 {
-  DEBUG_LOGF("config: exiting and saving (%d correction points)", correction_point_count);
+  SpinCalibration &calibration = spin_calibration[reversed];
+  DEBUG_LOGF("config: exiting and saving (%d correction points)", calibration.correction_point_count);
   save_config_settings();
-  show_led_feedback("config final saved", 1000, correction_point_count);
+  show_led_feedback("config final saved", 1000, calibration.correction_point_count);
   updateLED();
   config_mode = false;
   config_calibration_stage = CONFIG_STAGE_RPM;
@@ -849,7 +886,8 @@ bool wifi_entry_requested()
   static unsigned long last_pending_log_ms = 0;
   bool wifi_switch_high = duty[CH_WIFI_MODE] > 50;
   bool rc_safe = rc_status == true;
-  bool throttle_safe = duty[CH_SPIN_THROTTLE] <= throttle_low_percent;
+  bool throttle_safe = spin_requested_command(spin_throttle_input_percent) <=
+                        throttle_low_percent * 10;
   int ch1_centered_value = stick_percent_centered(CH_TRANSLATE_LR);
   int ch2_centered_value = stick_percent_centered(CH_TRANSLATE_FB);
   int ch4_centered_value = stick_percent_centered(CH_HEADING_YAW);
@@ -929,6 +967,7 @@ bool wifi_entry_requested()
 
 void handle_config_save_button()
 {
+  SpinCalibration &calibration = spin_calibration[reversed];
   unsigned long now = millis();
 
   // A three-press action cannot be committed on the third edge because the
@@ -946,8 +985,8 @@ void handle_config_save_button()
     {
       config_calibration_stage = CONFIG_STAGE_HEADING;
       DEBUG_LOGF("config: entering heading-offset calibration after %d CH8 presses with %d staged RPM points",
-                 completed_press_count, correction_point_count);
-      show_led_feedback("config heading mode", 1000, correction_point_count);
+                 completed_press_count, calibration.correction_point_count);
+      show_led_feedback("config heading mode", 1000, calibration.correction_point_count);
     }
   }
 
@@ -978,12 +1017,12 @@ void handle_config_save_button()
 
     if(config_stage_press_count >= config_clear_press_count)
     {
-      clearCorrectionTable();
-      offset = 1.0f;
+      clearCorrectionTable(calibration);
+      calibration.offset = 1.0f;
       config_stage_press_count = 0;
       config_stage_press_start_ms = 0;
       DEBUG_LOGF("config: RPM calibration cleared; LED heading preserved at %.1f degrees",
-                 led_heading_offset_deg);
+                 calibration.led_heading_offset_deg);
       show_led_feedback("config rpm cleared", 1000);
       return;
     }
@@ -1004,30 +1043,30 @@ void handle_config_save_button()
       int saved_throttle = map(constrain(duty[CH_SPIN_THROTTLE], 0, 100),
                                0, 100, -100, 100);
       bool replaced_full_table = false;
-      int saved_index = setCorrectionPoint(rpm, offset, saved_throttle,
+      int saved_index = setCorrectionPoint(rpm, calibration.offset, saved_throttle,
                                            &replaced_full_table);
       DEBUG_LOGF("config: correction point staged rpm=%d offset=%.4f throttle=%d count=%d index=%d replaced_full=%d",
-                 rpm, offset, saved_throttle, correction_point_count,
+                 rpm, calibration.offset, saved_throttle, calibration.correction_point_count,
                  saved_index, replaced_full_table ? 1 : 0);
       if(replaced_full_table)
       {
         show_led_feedback("config point replaced", 600,
-                          correction_point_count, saved_index);
+                          calibration.correction_point_count, saved_index);
       }
       else
       {
-        show_led_feedback("config point saved", 600, correction_point_count);
+        show_led_feedback("config point saved", 600, calibration.correction_point_count);
       }
     }
     else if(rpm > 200)
     {
       DEBUG_LOGF("config: correction capture rejected; RPM unstable rpm=%d variation=%.2f",
                  rpm, rpm_variation_ewma);
-      show_led_feedback("config unstable", 700, correction_point_count);
+      show_led_feedback("config unstable", 700, calibration.correction_point_count);
     }
     else
     {
-      show_led_feedback("config rpm mode", 400, correction_point_count);
+      show_led_feedback("config rpm mode", 400, calibration.correction_point_count);
     }
   }
   else if(duty[CH_CONFIG_SAVE] < 40)
@@ -1038,6 +1077,7 @@ void handle_config_save_button()
 
 void handle_config_adjustments()
 {
+  SpinCalibration &calibration = spin_calibration[reversed];
   unsigned long now = millis();
   float dt = constrain((now - last_config_adjust_ms) * 0.001f, 0.0f, 0.05f);
   last_config_adjust_ms = now;
@@ -1049,7 +1089,7 @@ void handle_config_adjustments()
 
   if(config_calibration_stage == CONFIG_STAGE_HEADING)
   {
-    led_heading_offset_deg = wrap360(led_heading_offset_deg +
+    calibration.led_heading_offset_deg = wrap360(calibration.led_heading_offset_deg +
                                      adjust_fraction * config_led_offset_rate_dps * dt);
   }
   else
@@ -1070,7 +1110,7 @@ void handle_config_adjustments()
       }
     }
 
-    offset = constrain(offset + rpm_adjust_fraction * config_rpm_offset_rate * dt,
+    calibration.offset = constrain(calibration.offset + rpm_adjust_fraction * config_rpm_offset_rate * dt,
                        0.8, 1.2);
   }
 
@@ -1083,7 +1123,7 @@ void config_loop()
   calcrpm();
   handle_config_adjustments();
 
-  if(duty[CH_SPIN_THROTTLE] > 10)
+  if(spin_requested_command(spin_throttle_input_percent) > 100)
   {
     // Translation testing belongs only to heading-offset calibration.
     if(config_calibration_stage == CONFIG_STAGE_HEADING &&
@@ -1135,7 +1175,7 @@ void config_loop()
   {
     LEDStatus = "heading on";
   }
-  else if(!phase_led_rendering && duty[CH_SPIN_THROTTLE] > 10)
+  else if(!phase_led_rendering && spin_requested_command(spin_throttle_input_percent) > 100)
   {
     LEDStatus = "motor on";
   }
@@ -1156,6 +1196,24 @@ void config_loop()
 }
 
 //----------------------------------------------------------------------------------------
+void update_spin_direction_input()
+{
+  // Select before CH7 entry, then keep the motor direction and calibration
+  // profile fixed until that calibration session ends.
+  if(!rc_status || config_mode || wifi_mode_active ||
+     spin_requested_command(spin_throttle_input_percent) >= 200 ||
+     duty[CH_SPIN_DIR] == 50) return;
+  bool next_reversed = duty[CH_SPIN_DIR] > 50;
+  if(next_reversed != reversed)
+  {
+    reversed = next_reversed;
+    DEBUG_LOGF("spin direction: %s; rpm_offset=%.4f led_offset=%.1f points=%d",
+               reversed ? "REVERSED" : "NORMAL", spin_calibration[reversed].offset,
+               spin_calibration[reversed].led_heading_offset_deg,
+               spin_calibration[reversed].correction_point_count);
+  }
+}
+
 void loop() 
 {
   get_battery();
@@ -1171,6 +1229,7 @@ void loop()
     return;
   }
 
+  update_spin_direction_input();
   update_config_mode();
   update_robot_state();
   service_session_logger();
@@ -1204,22 +1263,6 @@ void loop()
     return;
   }
 
-  if(duty[CH_SPIN_DIR] > 50 && duty[CH_SPIN_THROTTLE] < 20) //only reverses spin direction if throttle is under 20%
-  {
-    if(reversed == false)
-    {
-      reversed = true;
-      DEBUG_LOG("spin direction: REVERSED");
-    }
-  }
-  else if(duty[CH_SPIN_DIR] < 50 && duty[CH_SPIN_THROTTLE] < 20)
-  {
-    if(reversed)
-    {
-      reversed = false;
-      DEBUG_LOG("spin direction: NORMAL");
-    }
-  }
     bool phase_led_rendering = false;
     pending_translation_enabled = false;
     if(robot_state == ROBOT_MELTY)
@@ -1252,18 +1295,10 @@ void loop()
       set_phase_led_mode(PHASE_LED_DISABLED);
       spin();
     }
-    else if(robot_state == ROBOT_TANK && reversed == true &&
-            (duty[CH_TRANSLATE_FB] > 55 || duty[CH_TRANSLATE_FB] < 45)) //unstick using the right stick
-    {
-      set_phase_led_mode(PHASE_LED_DISABLED);
-      motorL = map(duty[CH_TRANSLATE_FB], 0, 100, 1000, -1000);
-      motorR = map(duty[CH_TRANSLATE_FB], 0, 100, -1000, 1000);
-    }
     else if(robot_state == ROBOT_TANK) //tank drive mode
     {
       set_phase_led_mode(PHASE_LED_DISABLED);
-      motorL = map(duty[CH_TRANSLATE_FB], 0, 100, 100, -100) + map(duty[CH_TRANSLATE_LR], 0, 100, 20, -20);
-      motorR = map(duty[CH_TRANSLATE_FB], 0, 100, -100, 100) + map(duty[CH_TRANSLATE_LR], 0, 100, 20, -20);
+      tank_drive();
     }
     else
     {

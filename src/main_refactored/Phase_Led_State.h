@@ -1,0 +1,34 @@
+#pragma once
+
+#include <stdint.h>
+
+enum PhaseLedMode : uint8_t
+{
+  PHASE_LED_DISABLED,
+  PHASE_LED_MELTY,
+  PHASE_LED_CONFIG_STABLE,
+  PHASE_LED_CONFIG_DARK
+};
+
+enum PhaseLedFrame : uint8_t
+{
+  PHASE_LED_FRAME_INVALID,
+  PHASE_LED_FRAME_OFF,
+  PHASE_LED_FRAME_TOP_HEADING,
+  PHASE_LED_FRAME_BOTTOM_HEADING,
+  PHASE_LED_FRAME_TOP_HEADING_BOTTOM_MOTOR,
+  PHASE_LED_FRAME_MOTOR_TOP_BOTTOM_HEADING,
+  PHASE_LED_FRAME_CONFIG_TOP_HEADING,
+  PHASE_LED_FRAME_CONFIG_BOTTOM_HEADING,
+  PHASE_LED_FRAME_CONFIG_STABLE,
+  PHASE_LED_FRAME_MOTOR_ON
+};
+
+struct PhaseLedSnapshot
+{
+  PhaseLedMode mode;
+  PhaseLedFrame frame;
+  uint32_t transition;
+};
+
+PhaseLedSnapshot read_phase_led_snapshot();

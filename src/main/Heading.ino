@@ -363,7 +363,7 @@ float wrap360(float deg)
 
 float current_led_heading_phase_deg()
 {
-  return wrap360(drive_heading_phase_deg + led_heading_offset_deg);
+  return wrap360(drive_heading_phase_deg + spin_calibration[reversed].led_heading_offset_deg);
 }
 
 int stick_percent_centered(int channel)
@@ -399,8 +399,77 @@ bool validStoredFloat(float val, float min_value, float max_value)
   return !isnan(val) && val >= min_value && val <= max_value;
 }
 
-void load_config_settings()
+void load_spin_calibration(SpinCalibration &calibration, const char *prefix,
+                           const SpinCalibration &defaults)
 {
+  char key[16]; // ESP32 NVS keys allow at most 15 characters.
+  snprintf(key, sizeof(key), "%srpm_offset", prefix);
+  calibration.offset = config_store.getFloat(key, defaults.offset);
+  if(!validStoredFloat(calibration.offset, 0.8, 1.2)) calibration.offset = 1.0f;
+  snprintf(key, sizeof(key), "%sled_heading", prefix);
+  calibration.led_heading_offset_deg = config_store.getFloat(key, defaults.led_heading_offset_deg);
+  if(!isfinite(calibration.led_heading_offset_deg) ||
+     calibration.led_heading_offset_deg < 0.0f || calibration.led_heading_offset_deg >= 360.0f)
+    calibration.led_heading_offset_deg = 315.0f;
+  snprintf(key, sizeof(key), "%scorr_count", prefix);
+  calibration.correction_point_count = config_store.getInt(key, defaults.correction_point_count);
+  if(calibration.correction_point_count < 0 || calibration.correction_point_count > MAX_CORRECTION_POINTS)
+  {
+    clearCorrectionTable(calibration);
+    return;
+  }
+  for(int i = 0; i < MAX_CORRECTION_POINTS; i++)
+  {
+    snprintf(key, sizeof(key), "%srpm%d", prefix, i);
+    calibration.correction_rpm[i] = config_store.getFloat(key, defaults.correction_rpm[i]);
+    snprintf(key, sizeof(key), "%soff%d", prefix, i);
+    calibration.correction_offset[i] = config_store.getFloat(key, defaults.correction_offset[i]);
+    snprintf(key, sizeof(key), "%sthr%d", prefix, i);
+    calibration.correction_throttle[i] = constrain(config_store.getInt(key, defaults.correction_throttle[i]), -100, 100);
+    if(!isfinite(calibration.correction_rpm[i]) || calibration.correction_rpm[i] < 0.0f)
+      calibration.correction_rpm[i] = 0.0f;
+    if(!validStoredFloat(calibration.correction_offset[i], 0.8, 1.2))
+      calibration.correction_offset[i] = 1.0f;
+  }
+  sortCorrectionTable(calibration);
+}
+
+void save_spin_calibration(SpinCalibration &calibration, const char *prefix)
+{
+  sortCorrectionTable(calibration);
+  char key[16];
+  snprintf(key, sizeof(key), "%srpm_offset", prefix);
+  config_store.putFloat(key, calibration.offset);
+  snprintf(key, sizeof(key), "%sled_heading", prefix);
+  config_store.putFloat(key, calibration.led_heading_offset_deg);
+  snprintf(key, sizeof(key), "%scorr_count", prefix);
+  config_store.putInt(key, calibration.correction_point_count);
+  for(int i = 0; i < MAX_CORRECTION_POINTS; i++)
+  {
+    snprintf(key, sizeof(key), "%srpm%d", prefix, i);
+    config_store.putFloat(key, calibration.correction_rpm[i]);
+    snprintf(key, sizeof(key), "%soff%d", prefix, i);
+    config_store.putFloat(key, calibration.correction_offset[i]);
+    snprintf(key, sizeof(key), "%sthr%d", prefix, i);
+    config_store.putInt(key, calibration.correction_throttle[i]);
+  }
+}
+
+void load_drive_tuning_settings()
+{
+  if(config_store.getInt("drive_tune_v", 0) != DRIVE_TUNING_VERSION)
+  {
+    // The old coefficient used a different curve. Install the requested tuning
+    // once, without clearing calibration or subsequent web UI adjustments.
+    acc_rate = DEFAULT_ACC_RATE;
+    percentdecel = DEFAULT_PERCENT_DECEL;
+    config_store.putFloat("acc_rate", acc_rate);
+    config_store.putFloat("pulse_pct", percentdecel);
+    config_store.putInt("drive_tune_v", DRIVE_TUNING_VERSION);
+    DEBUG_LOG("drive tuning: installed nonlinear spin-up and 25% pulses");
+    return;
+  }
+
   acc_rate = config_store.getFloat("acc_rate", DEFAULT_ACC_RATE);
   if(!validStoredFloat(acc_rate, MIN_ACC_RATE, MAX_ACC_RATE))
     acc_rate = DEFAULT_ACC_RATE;
@@ -408,6 +477,43 @@ void load_config_settings()
   percentdecel = config_store.getFloat("pulse_pct", DEFAULT_PERCENT_DECEL);
   if(!validStoredFloat(percentdecel, MIN_PERCENT_DECEL, MAX_PERCENT_DECEL))
     percentdecel = DEFAULT_PERCENT_DECEL;
+}
+
+void load_spin_ramp_setting()
+{
+  spin_ramp_start_rpm = config_store.getFloat("ramp_start_rpm", NAN);
+  if(isnan(spin_ramp_start_rpm))
+  {
+    // Preserve the existing saved coefficient's curve on the first upgrade.
+    // Later coefficient edits leave this knee fixed and independent.
+    spin_ramp_start_rpm = powf(SPIN_ACCEL_MIN_COMMAND / acc_rate,
+                               1.0f / SPIN_ACCEL_EXPONENT);
+    config_store.putFloat("ramp_start_rpm", spin_ramp_start_rpm);
+  }
+  else if(!validStoredFloat(spin_ramp_start_rpm, MIN_SPIN_RAMP_START_RPM,
+                            MAX_SPIN_RAMP_START_RPM))
+  {
+    spin_ramp_start_rpm = DEFAULT_SPIN_RAMP_START_RPM;
+    config_store.putFloat("ramp_start_rpm", spin_ramp_start_rpm);
+  }
+}
+
+void load_motor_full_scale_setting()
+{
+  motor_full_scale_percent = config_store.getFloat("motor_full_pct", NAN);
+  if(!validStoredFloat(motor_full_scale_percent, MIN_MOTOR_FULL_SCALE_PERCENT,
+                       MAX_MOTOR_FULL_SCALE_PERCENT))
+  {
+    motor_full_scale_percent = DEFAULT_MOTOR_FULL_SCALE_PERCENT;
+    config_store.putFloat("motor_full_pct", motor_full_scale_percent);
+  }
+}
+
+void load_config_settings()
+{
+  load_drive_tuning_settings();
+  load_spin_ramp_setting();
+  load_motor_full_scale_setting();
 
   translation_scale_factor =
       config_store.getFloat("trans_scale", DEFAULT_TRANSLATION_SCALE_FACTOR);
@@ -415,19 +521,17 @@ void load_config_settings()
                        MAX_TRANSLATION_SCALE_FACTOR))
     translation_scale_factor = DEFAULT_TRANSLATION_SCALE_FACTOR;
 
-  offset = config_store.getFloat("rpm_offset", 1.0);
-  if(validStoredFloat(offset, 0.8, 1.2) == false)
-  {
-    offset = 1.0;
-  }
+  top_led_phase_offset_deg =
+      config_store.getFloat("top_led_trim", DEFAULT_TOP_LED_PHASE_OFFSET_DEG);
+  if(!validStoredFloat(top_led_phase_offset_deg, MIN_LED_PHASE_OFFSET_DEG,
+                       MAX_LED_PHASE_OFFSET_DEG))
+    top_led_phase_offset_deg = DEFAULT_TOP_LED_PHASE_OFFSET_DEG;
 
-  float stored_led_heading_offset =
-      config_store.getFloat("led_heading", led_heading_offset_deg);
-  if(!isnan(stored_led_heading_offset) &&
-     stored_led_heading_offset >= 0.0 && stored_led_heading_offset < 360.0)
-  {
-    led_heading_offset_deg = stored_led_heading_offset;
-  }
+  bottom_led_phase_offset_deg =
+      config_store.getFloat("bot_led_trim", DEFAULT_BOTTOM_LED_PHASE_OFFSET_DEG);
+  if(!validStoredFloat(bottom_led_phase_offset_deg, MIN_LED_PHASE_OFFSET_DEG,
+                       MAX_LED_PHASE_OFFSET_DEG))
+    bottom_led_phase_offset_deg = DEFAULT_BOTTOM_LED_PHASE_OFFSET_DEG;
 
   accel_zero_x_g_offset = config_store.getFloat("accel_zero_x", 0.0);
   if(isnan(accel_zero_x_g_offset) || fabs(accel_zero_x_g_offset) > 20.0)
@@ -441,36 +545,10 @@ void load_config_settings()
     accel_zero_y_g_offset = 0.0;
   }
 
-  correction_point_count = config_store.getInt("corr_count", 0);
-  if(correction_point_count < 0 || correction_point_count > MAX_CORRECTION_POINTS)
-  {
-    clearCorrectionTable();
-    return;
-  }
-
-  for(int i = 0; i < MAX_CORRECTION_POINTS; i++)
-  {
-    char rpm_key[8];
-    char offset_key[8];
-    char throttle_key[8];
-    snprintf(rpm_key, sizeof(rpm_key), "rpm%d", i);
-    snprintf(offset_key, sizeof(offset_key), "off%d", i);
-    snprintf(throttle_key, sizeof(throttle_key), "thr%d", i);
-
-    correction_rpm[i] = config_store.getFloat(rpm_key, 0.0);
-    correction_offset[i] = config_store.getFloat(offset_key, 1.0);
-    correction_throttle[i] = constrain(config_store.getInt(throttle_key, 0), -100, 100);
-    if(isnan(correction_rpm[i]) || correction_rpm[i] < 0.0)
-    {
-      correction_rpm[i] = 0.0;
-    }
-    if(isnan(correction_offset[i]) || correction_offset[i] < 0.8 || correction_offset[i] > 1.2)
-    {
-      correction_offset[i] = 1.0;
-    }
-  }
-
-  sortCorrectionTable();
+  const SpinCalibration defaults;
+  load_spin_calibration(spin_calibration[0], "", defaults);
+  // Seed reverse from legacy calibration until it has its own saved values.
+  load_spin_calibration(spin_calibration[1], "r_", spin_calibration[0]);
 }
 
 void set_accel_zero_offset()
@@ -508,53 +586,54 @@ void set_accel_zero_offset()
   reset_rotation_phase_requested = true;
 }
 
-void clearCorrectionTable()
+void clearCorrectionTable(SpinCalibration &calibration)
 {
-  correction_point_count = 0;
+  calibration.correction_point_count = 0;
   for(int i = 0; i < MAX_CORRECTION_POINTS; i++)
   {
-    correction_rpm[i] = 0.0;
-    correction_offset[i] = 1.0;
-    correction_throttle[i] = 0;
+    calibration.correction_rpm[i] = 0.0;
+    calibration.correction_offset[i] = 1.0;
+    calibration.correction_throttle[i] = 0;
   }
 }
 
-void sortCorrectionTable()
+void sortCorrectionTable(SpinCalibration &calibration)
 {
-  for(int i = 1; i < correction_point_count; i++)
+  for(int i = 1; i < calibration.correction_point_count; i++)
   {
-    float rpm_key = correction_rpm[i];
-    float offset_key = correction_offset[i];
-    int throttle_key = correction_throttle[i];
+    float rpm_key = calibration.correction_rpm[i];
+    float offset_key = calibration.correction_offset[i];
+    int throttle_key = calibration.correction_throttle[i];
     int j = i - 1;
-    while(j >= 0 && correction_rpm[j] > rpm_key)
+    while(j >= 0 && calibration.correction_rpm[j] > rpm_key)
     {
-      correction_rpm[j + 1] = correction_rpm[j];
-      correction_offset[j + 1] = correction_offset[j];
-      correction_throttle[j + 1] = correction_throttle[j];
+      calibration.correction_rpm[j + 1] = calibration.correction_rpm[j];
+      calibration.correction_offset[j + 1] = calibration.correction_offset[j];
+      calibration.correction_throttle[j + 1] = calibration.correction_throttle[j];
       j--;
     }
-    correction_rpm[j + 1] = rpm_key;
-    correction_offset[j + 1] = offset_key;
-    correction_throttle[j + 1] = throttle_key;
+    calibration.correction_rpm[j + 1] = rpm_key;
+    calibration.correction_offset[j + 1] = offset_key;
+    calibration.correction_throttle[j + 1] = throttle_key;
   }
 }
 
 int setCorrectionPoint(float point_rpm, float point_offset, int point_throttle,
                        bool *replaced_full_table)
 {
+  SpinCalibration &calibration = spin_calibration[reversed];
   point_offset = constrain(point_offset, 0.8, 1.2);
   point_throttle = constrain(point_throttle, -100, 100);
-  bool table_was_full = correction_point_count >= MAX_CORRECTION_POINTS;
+  bool table_was_full = calibration.correction_point_count >= MAX_CORRECTION_POINTS;
 
-  int slot = correction_point_count;
-  if(correction_point_count > 0)
+  int slot = calibration.correction_point_count;
+  if(calibration.correction_point_count > 0)
   {
     int closest_slot = 0;
-    float closest_delta = fabs(correction_rpm[0] - point_rpm);
-    for(int i = 1; i < correction_point_count; i++)
+    float closest_delta = fabs(calibration.correction_rpm[0] - point_rpm);
+    for(int i = 1; i < calibration.correction_point_count; i++)
     {
-      float delta = fabs(correction_rpm[i] - point_rpm);
+      float delta = fabs(calibration.correction_rpm[i] - point_rpm);
       if(delta < closest_delta)
       {
         closest_delta = delta;
@@ -567,17 +646,17 @@ int setCorrectionPoint(float point_rpm, float point_offset, int point_throttle,
     }
   }
 
-  if(slot == correction_point_count && correction_point_count < MAX_CORRECTION_POINTS)
+  if(slot == calibration.correction_point_count && calibration.correction_point_count < MAX_CORRECTION_POINTS)
   {
-    correction_point_count++;
+    calibration.correction_point_count++;
   }
-  else if(slot == correction_point_count)
+  else if(slot == calibration.correction_point_count)
   {
     slot = 0;
-    float best_delta = fabs(correction_rpm[0] - point_rpm);
+    float best_delta = fabs(calibration.correction_rpm[0] - point_rpm);
     for(int i = 1; i < MAX_CORRECTION_POINTS; i++)
     {
-      float delta = fabs(correction_rpm[i] - point_rpm);
+      float delta = fabs(calibration.correction_rpm[i] - point_rpm);
       if(delta < best_delta)
       {
         best_delta = delta;
@@ -586,17 +665,17 @@ int setCorrectionPoint(float point_rpm, float point_offset, int point_throttle,
     }
   }
 
-  correction_rpm[slot] = point_rpm;
-  correction_offset[slot] = point_offset;
-  correction_throttle[slot] = point_throttle;
-  sortCorrectionTable();
+  calibration.correction_rpm[slot] = point_rpm;
+  calibration.correction_offset[slot] = point_offset;
+  calibration.correction_throttle[slot] = point_throttle;
+  sortCorrectionTable(calibration);
 
   int sorted_index = 0;
-  for(int i = 0; i < correction_point_count; i++)
+  for(int i = 0; i < calibration.correction_point_count; i++)
   {
-    if(correction_rpm[i] == point_rpm &&
-       correction_offset[i] == point_offset &&
-       correction_throttle[i] == point_throttle)
+    if(calibration.correction_rpm[i] == point_rpm &&
+       calibration.correction_offset[i] == point_offset &&
+       calibration.correction_throttle[i] == point_throttle)
     {
       sorted_index = i;
       break;
@@ -611,39 +690,40 @@ int setCorrectionPoint(float point_rpm, float point_offset, int point_throttle,
 
 float getRotationOffsetForRpm(float current_rpm)
 {
+  const SpinCalibration &calibration = spin_calibration[reversed];
   // RPM calibration uses the live offset being adjusted. Heading calibration
   // uses the staged table so the heading is checked against the full curve.
   if((config_mode == true && config_calibration_stage == CONFIG_STAGE_RPM) ||
-     correction_point_count == 0)
+     calibration.correction_point_count == 0)
   {
-    return constrain(offset, 0.8, 1.2);
+    return constrain(calibration.offset, 0.8, 1.2);
   }
 
-  if(current_rpm <= correction_rpm[0])
+  if(current_rpm <= calibration.correction_rpm[0])
   {
-    return correction_offset[0];
+    return calibration.correction_offset[0];
   }
 
-  int last = correction_point_count - 1;
-  if(current_rpm >= correction_rpm[last])
+  int last = calibration.correction_point_count - 1;
+  if(current_rpm >= calibration.correction_rpm[last])
   {
-    return correction_offset[last];
+    return calibration.correction_offset[last];
   }
 
-  for(int i = 1; i < correction_point_count; i++)
+  for(int i = 1; i < calibration.correction_point_count; i++)
   {
-    if(current_rpm <= correction_rpm[i])
+    if(current_rpm <= calibration.correction_rpm[i])
     {
-      float low_rpm = correction_rpm[i - 1];
-      float high_rpm = correction_rpm[i];
+      float low_rpm = calibration.correction_rpm[i - 1];
+      float high_rpm = calibration.correction_rpm[i];
       if(high_rpm == low_rpm)
       {
-        return correction_offset[i];
+        return calibration.correction_offset[i];
       }
       float frac = (current_rpm - low_rpm) / (high_rpm - low_rpm);
-      return correction_offset[i - 1] + frac * (correction_offset[i] - correction_offset[i - 1]);
+      return calibration.correction_offset[i - 1] + frac * (calibration.correction_offset[i] - calibration.correction_offset[i - 1]);
     }
   }
 
-  return constrain(offset, 0.8, 1.2);
+  return constrain(calibration.offset, 0.8, 1.2);
 }

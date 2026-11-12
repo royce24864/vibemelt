@@ -35,30 +35,122 @@ const char SESSION_DASHBOARD_HTML[] PROGMEM = R"__MELTYHTML__(<!doctype html>
 <title>Vibemelt Session Diagnostics</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui;background:#0b1020;color:#eef2ff}body{margin:0;padding:14px;max-width:1100px;margin:auto}h1{font-size:1.45rem;margin:.25rem 0}h2{font-size:1.1rem;margin:.2rem 0 .8rem}.sub,.muted{color:#a5b4fc}.sub{margin:.2rem 0 1rem}.grid,.config-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:8px}.config-grid{grid-template-columns:repeat(auto-fit,minmax(245px,1fr))}.card,section,.setting{background:#151d35;border:1px solid #303b61;border-radius:10px;padding:10px}.setting{background:#10172b}.setting p{min-height:4.8em;font-size:.82rem;color:#c7d2fe}.label{color:#a5b4fc;font-size:.78rem}.value{font-size:1.1rem;font-weight:650;overflow-wrap:anywhere}section{margin-top:10px}a,button{display:inline-block;background:#4f46e5;color:white;border:0;border-radius:7px;padding:9px 11px;margin:3px;text-decoration:none}button.secondary{background:#334155}button:disabled{opacity:.45}input[type=number]{width:7em;background:#080d1b;color:#fff;border:1px solid #64748b;border-radius:6px;padding:8px}#config-status{min-height:1.2em;margin-top:6px;font-size:.85rem}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.78rem}table{border-collapse:collapse;width:100%;font-size:.72rem}th,td{padding:5px;border-bottom:1px solid #303b61;text-align:right;white-space:nowrap}th:nth-child(2),td:nth-child(2){text-align:left}.scroll{overflow:auto}.error{color:#fca5a5}.success{color:#86efac}
+.curve-panel{margin-top:16px;border-top:1px solid #303b61;padding-top:14px}.curve-panel p{font-size:.85rem}.curve-legend{display:flex;gap:18px;flex-wrap:wrap;font-size:.85rem;margin:8px 0}.curve-key{display:inline-block;width:28px;margin-right:6px;vertical-align:middle;border-top:3px solid #67e8f9}.curve-key.default{border-top:2px dotted #cbd5e1;opacity:.65}#spin-curve-svg{display:block;width:100%;height:auto;max-height:400px;background:#10172b;border-radius:8px}#spin-curve-status{min-height:1.3em;margin-top:6px;font-size:.85rem}input[aria-invalid=true]{border-color:#fca5a5}
+.ramp-controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.ramp-controls .setting{padding:8px}.ramp-controls .value{display:block;font-size:1rem}.ramp-controls .setting p{min-height:0;margin:5px 0;font-size:.78rem}.ramp-controls button{padding:7px 9px}.ramp-controls input[type=number]{padding:6px;width:7em}@media(max-width:600px){.ramp-controls{grid-template-columns:1fr}.ramp-controls .setting{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 8px;align-items:center}.ramp-controls .setting p{grid-column:1/-1;grid-row:2}.ramp-controls .setting .setting-actions{grid-column:1/-1;display:flex;gap:3px;align-items:center;flex-wrap:wrap}.ramp-controls .setting .setting-range{display:none}}
 </style></head><body>
 <h1>Vibemelt session diagnostics</h1><div class="sub">Local RAM log &middot; 10 Hz &middot; latest five minutes</div>
 <div id="live" class="grid"></div>
-<section><h2>Drive configuration</h2><div class="muted">Changes are saved to controller memory and take effect on the next drive after leaving WiFi mode.</div><div id="config" class="config-grid"></div><div id="config-status"></div></section>
+  <section><h2>Drive and LED configuration</h2><div class="muted">Changes are saved to controller memory and take effect on the next drive after leaving WiFi mode.</div><div id="config" class="config-grid"></div><div id="config-status"></div><div class="curve-panel"><h2>Spin-up command ceiling</h2><p class="muted">Edit either ramp control to preview before saving. The graph shows logical command before the physical full-output limit.</p><div id="ramp-config" class="ramp-controls"></div><div class="curve-legend"><span><i class="curve-key"></i>Current preview</span><span><i class="curve-key default"></i>Firmware default</span></div><svg id="spin-curve-svg" viewBox="0 0 760 360" role="img" aria-label="Spin-up logical command ceiling versus body RPM"></svg><div id="spin-curve-status" class="muted" role="status" aria-live="polite">Loading ramp configuration...</div></div></section>
 <section><div><a href="/api/timeline.csv">Download full CSV</a><a href="/api/melty.csv">Download MELTY CSV</a><a href="/api/events.txt">Download events</a></div><pre id="summary">Loading summary...</pre></section>
-<section><div><button id="prev">Previous</button><button id="next">Next</button><label><input id="melty" type="checkbox"> Show MELTY rows only</label> <span id="page"></span></div><div class="scroll"><table><thead><tr><th>time</th><th>state</th><th>rpm</th><th>g</th><th>V</th><th>CH1</th><th>CH2</th><th>thr</th><th>spin%</th><th>base</th><th>ceil</th><th>L avg</th><th>R avg</th><th>var</th><th>flags</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+<section><div><button id="prev">Previous</button><button id="next">Next</button><label><input id="melty" type="checkbox"> Show MELTY rows only</label> <span id="page"></span></div><div class="muted">Throttle is raw receiver input (-100 to 100). Spin request, base, and ceiling use the logical 0–100% range; L/R output averages show final physical motor output. Tank drive bypasses the full-output percentage.</div><div class="scroll"><table><thead><tr><th>time</th><th>state</th><th>rpm</th><th>g</th><th>V</th><th>CH1</th><th>CH2</th><th>raw thr</th><th>spin% logical</th><th>base logical</th><th>ceil logical</th><th>L out%</th><th>R out%</th><th>var</th><th>flags</th></tr></thead><tbody id="rows"></tbody></table></div></section>
 <script>
-const live=document.querySelector('#live'),summary=document.querySelector('#summary'),rows=document.querySelector('#rows'),pageText=document.querySelector('#page'),configBox=document.querySelector('#config'),configStatus=document.querySelector('#config-status');let start=0,count=40,total=0,configBusy=false;
+const live=document.querySelector('#live'),summary=document.querySelector('#summary'),rows=document.querySelector('#rows'),pageText=document.querySelector('#page'),configBox=document.querySelector('#config'),rampConfigBox=document.querySelector('#ramp-config'),configStatus=document.querySelector('#config-status'),spinCurveSvg=document.querySelector('#spin-curve-svg'),spinCurveStatus=document.querySelector('#spin-curve-status');let start=0,count=40,total=0,configBusy=false,savedConfiguration=null;
 const card=(label,value)=>`<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
 const delayMs=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function fetchJson(url,options={}){const readOnly=!options.method||options.method==='GET',attempts=readOnly?3:1;let lastError;for(let attempt=1;attempt<=attempts;attempt++){const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),8000);try{const response=await fetch(url,{cache:'no-store',...options,signal:controller.signal});const text=await response.text();let result;try{result=JSON.parse(text)}catch(e){throw new Error(`Invalid JSON from ${url} (HTTP ${response.status})`)}if(!response.ok)throw new Error(result.error||`HTTP ${response.status}`);clearTimeout(timeout);return result}catch(e){clearTimeout(timeout);lastError=e;if(attempt<attempts)await delayMs(400)}}throw new Error(`${(lastError&&lastError.message)||'request failed'} after ${attempts} attempt${attempts===1?'':'s'}`)}
 const configDefinitions=[
- {key:'translation_scale_factor',label:'Translation scale factor',help:'Scales how far each translation pulse moves a motor command away from the base spin command. 0.00 disables translation modulation; 1.00 applies the full zero-to-full pulse difference.',min:0,max:1,step:.05,digits:2},
+ {key:'translation_scale_factor',label:'Translation scale factor',help:'Scales how far each translation pulse moves a motor command away from the base spin command. 0.00 disables translation modulation; 1.00 applies the full pulse difference; 2.00 doubles that difference, subject to motor command limits.',min:0,max:2,step:.05,digits:2},
  {key:'percentdecel',label:'Translation pulse width (%)',help:'Live angular percentage of one rotation for each opposing pulse. The motors return to the base spin command immediately after the phase leaves each window. Larger values provide a longer impulse, but can increase braking, current draw, ESC stress, and motor heating.',min:1,max:50,step:1,digits:1},
- {key:'acc_rate',label:'Spin acceleration rate',help:'Slope of the RPM-based spin ceiling: maximum DShot command = 200 + rate × RPM. Lower values ramp more gently; higher values reach requested throttle sooner and demand more current.',min:.2,max:1,step:.05,digits:2}
+ {key:'spin_ramp_start_rpm',label:'Ramp start RPM',help:'Body RPM at which the logical spin ceiling starts rising above its 200-command floor. This knee is independent of the ramp slope.',compactHelp:'Hold at command 200 until this body RPM.',min:0,max:5000,step:1,digits:2},
+ {key:'acc_rate',label:'Ramp slope (coefficient)',help:'Controls how quickly the logical ceiling rises after the selected start RPM: 200 + coefficient × (RPM^1.2 − start RPM^1.2), capped at 999. Lower values rise more gently; changing the slope keeps the start RPM fixed.',compactHelp:'Higher rises faster after the start RPM; the start stays fixed.',min:.01,max:1,step:.01,digits:2},
+ {key:'motor_full_scale_percent',label:'Full-output throttle (%)',help:'Sets both the spin-input endpoint and physical output limit for spin, translation and calibration. At 64.7%, 64.7% throttle requests 100% logical spin and physical output is capped at 64.7%. Full translation holds one motor at that cap and cuts the other. Tank drive bypasses this setting; held CH8 boost can reach full motor output. The spin acceleration limiter still applies.',min:1,max:100,step:.1,digits:2},
+ {key:'top_led_phase_offset_deg',label:'Top LED phase offset (°)',help:'Additional display-only phase trim for the top heading marker, applied after the saved shared LED calibration. Positive values move the marker forward in phase. Motor timing is unchanged.',min:-180,max:180,step:1,digits:1},
+ {key:'bottom_led_phase_offset_deg',label:'Bottom LED phase offset (°)',help:'Additional display-only phase trim for the bottom heading marker, applied after its normal 180° underside orientation. Motor timing is unchanged.',min:-180,max:180,step:1,digits:1}
 ];
-async function loadConfiguration(){try{const x=await fetchJson('/api/config.json');configBox.innerHTML=configDefinitions.map(d=>`<div class="setting"><div class="value">${d.label}</div><p>${d.help}</p><div><input id="cfg-${d.key}" type="number" min="${d.min}" max="${d.max}" step="${d.step}" value="${Number(x[d.key]).toFixed(d.digits)}"><button onclick="updateConfiguration('${d.key}',false)">Save</button><button class="secondary" onclick="updateConfiguration('${d.key}',true)">Reset to ${Number(x.defaults[d.key]).toFixed(d.digits)}</button></div><div class="label">Allowed ${d.min} to ${d.max}</div></div>`).join('')}catch(e){configBox.innerHTML=`<span class="error">Configuration load failed: ${e.message}</span>`}}
-async function updateConfiguration(name,reset){if(configBusy)return;if(reset&&!confirm('Reset this setting to its firmware default?'))return;configBusy=true;configBox.querySelectorAll('button,input').forEach(x=>x.disabled=true);configStatus.className='';configStatus.textContent=reset?'Resetting...':'Saving...';try{let url=`${reset?'/api/config/reset':'/api/config'}?name=${encodeURIComponent(name)}`;if(!reset)url+=`&value=${encodeURIComponent(document.querySelector(`#cfg-${name}`).value)}`;const result=await fetchJson(url,{method:'POST'});configStatus.className='success';configStatus.textContent=`${result.name} saved and verified as ${result.value}`;await loadConfiguration()}catch(e){configStatus.className='error';configStatus.textContent=e.message}finally{configBusy=false;configBox.querySelectorAll('button,input').forEach(x=>x.disabled=false)}}
-async function refreshLive(){try{const x=await fetchJson('/api/live.json');live.innerHTML=card('WiFi',x.wifi_active?'active':'inactive')+card('AP / clients',`${x.ap_ready?'ready':'recovering'} / ${x.ap_clients}`)+card('AP restarts / start failures',`${x.ap_restarts} / ${x.ap_start_failures}`)+card('RC link / loss',`${x.rc_link?'ready':'lost'} / ${x.rc_loss_seconds.toFixed(1)} s`)+card('State',x.robot_state)+card('Before WiFi',x.last_operating_state)+card('Recording',x.recording)+card('Samples',x.stored_samples)+card('RPM / g',`${x.rpm} / ${x.g_force.toFixed(2)}`)+card('Battery',`${x.battery_volts.toFixed(2)} V`)+card('CH1 / CH2 / throttle',`${x.ch1} / ${x.ch2} / ${x.throttle}`)+card('Base / ceiling',`${x.base_spin_command} / ${x.acceleration_ceiling}`)+card('DShot avg L / R',`${x.left_dshot_average} / ${x.right_dshot_average}`)+card('Limiter / safety gate',`${x.acceleration_limiter_active?'ON':'off'} / ${x.safety_gate_closed?'CLOSED':'open'}`)+card('Free / min heap',`${x.free_heap} / ${x.minimum_free_heap}`);return true}catch(e){live.innerHTML=`<span class="error">Live update failed: ${e.message}</span>`;return false}}
+function configurationValue(key){const input=document.querySelector(`#cfg-${key}`),definition=configDefinitions.find(d=>d.key===key),bounds=savedConfiguration&&savedConfiguration.limits&&savedConfiguration.limits[key];if(!input||!definition)return null;const value=Number(input.value),minimum=bounds?bounds[0]:definition.min,maximum=bounds?bounds[1]:definition.max,valid=input.value.trim()!==''&&Number.isFinite(value)&&value>=minimum&&value<=maximum;input.setAttribute('aria-invalid',valid?'false':'true');return valid?value:null}
+function configurationDisplayValue(definition,value){return definition.key==='acc_rate'||definition.key==='spin_ramp_start_rpm'?String(Number(value)):Number(value).toFixed(definition.digits)}
+function spinCurveCommand(rpm,startRpm,coefficient,model){if(!model||![rpm,startRpm,coefficient,model.floor_command,model.max_command,model.exponent].every(Number.isFinite))return NaN;const bodyRpm=Math.max(0,rpm),rise=Math.pow(Math.max(bodyRpm,startRpm),model.exponent)-Math.pow(startRpm,model.exponent);return Math.trunc(Math.max(model.floor_command,Math.min(model.max_command,model.floor_command+coefficient*rise)))}
+function spinCurveLayout(){
+ const width=Math.max(240,Math.round(spinCurveSvg.getBoundingClientRect().width||spinCurveSvg.clientWidth||760));
+ return {width,height:320,left:60,right:width-18,top:24,bottom:270};
+}
+function spinCurvePath(startRpm,coefficient,model,layout=spinCurveLayout()){
+ let path='';
+ for(let rpm=0;rpm<=5000;rpm+=10){
+  const x=layout.left+rpm/5000*(layout.right-layout.left);
+  const y=layout.bottom-spinCurveCommand(rpm,startRpm,coefficient,model)/1000*(layout.bottom-layout.top);
+  path+=`${rpm?'L':'M'}${x.toFixed(2)},${y.toFixed(2)} `;
+ }
+ return path;
+}
+function renderSpinCurve(){
+ if(!savedConfiguration)return;
+ const model=savedConfiguration.spin_curve,defaults=savedConfiguration.defaults;
+ const start=configurationValue('spin_ramp_start_rpm'),coefficient=configurationValue('acc_rate');
+ if(!model||!defaults||![model.floor_command,model.max_command,model.exponent,defaults.spin_ramp_start_rpm,defaults.acc_rate].every(Number.isFinite)){
+  spinCurveSvg.innerHTML='';spinCurveStatus.className='error';
+  spinCurveStatus.textContent='Ramp graph configuration is unavailable.';return;
+ }
+ const layout=spinCurveLayout(),xTicks=layout.width<460?[0,2500,5000]:[0,1000,2000,3000,4000,5000];
+ spinCurveSvg.setAttribute('viewBox',`0 0 ${layout.width} ${layout.height}`);
+ let axes='';
+ for(const rpm of xTicks){
+  const x=layout.left+rpm/5000*(layout.right-layout.left);
+  axes+=`<line x1="${x}" y1="${layout.top}" x2="${x}" y2="${layout.bottom}" stroke="#303b61"/><text x="${x}" y="${layout.bottom+22}" text-anchor="middle">${rpm}</text>`;
+ }
+ for(let command=0;command<=1000;command+=200){
+  const y=layout.bottom-command/1000*(layout.bottom-layout.top);
+  axes+=`<line x1="${layout.left}" y1="${y}" x2="${layout.right}" y2="${y}" stroke="#303b61"/><text x="${layout.left-10}" y="${y+4}" text-anchor="end">${command}</text>`;
+ }
+ axes+=`<text x="${(layout.left+layout.right)/2}" y="${layout.height-5}" text-anchor="middle">Body RPM</text><text transform="translate(15 ${(layout.top+layout.bottom)/2}) rotate(-90)" text-anchor="middle">Logical command</text>`;
+ const valid=start!==null&&coefficient!==null;
+ const defaultPath=spinCurvePath(defaults.spin_ramp_start_rpm,defaults.acc_rate,model,layout);
+ const previewPath=valid?spinCurvePath(start,coefficient,model,layout):null;
+ spinCurveSvg.innerHTML=`<g fill="#c7d2fe" font-family="system-ui,sans-serif" font-size="12">${axes}</g>${valid?`<path id="spin-curve-preview" d="${previewPath}" fill="none" stroke="#67e8f9" stroke-width="4"/>`:''}<path id="spin-curve-default" d="${defaultPath}" fill="none" stroke="#cbd5e1" stroke-opacity=".65" stroke-width="2" stroke-dasharray="3 6"/>`;
+ if(!valid){
+  spinCurveStatus.className='error';
+  spinCurveStatus.textContent='Enter a valid ramp start RPM and slope within their allowed ranges. The dotted default remains visible.';return;
+ }
+ const dirty=['spin_ramp_start_rpm','acc_rate'].some(key=>{
+  return configurationValue(key)!==Number(savedConfiguration[key]);
+ });
+ spinCurveStatus.className=dirty?'success':'muted';
+ spinCurveStatus.textContent=dirty?'Unsaved ramp preview. Save each changed control to apply this curve.':'Saved ramp curve. Edit either control to preview changes before saving.';
+}
+function isRampSetting(definition){return definition.key==='spin_ramp_start_rpm'||definition.key==='acc_rate'}
+function renderConfigurationSetting(definition,configuration,compact=false){
+ const d=definition,help=compact?d.compactHelp:d.help;
+ return `<div class="setting"><label class="value" for="cfg-${d.key}">${d.label}</label><p>${help}</p><div class="setting-actions"><input id="cfg-${d.key}" aria-label="${d.label}" type="number" min="${d.min}" max="${d.max}" step="${d.step}" value="${configurationDisplayValue(d,configuration[d.key])}"><button onclick="updateConfiguration('${d.key}',false)">Save</button><button class="secondary" onclick="updateConfiguration('${d.key}',true)">Reset to ${Number(configuration.defaults[d.key]).toFixed(d.digits)}</button></div><div class="label setting-range">Allowed ${d.min} to ${d.max}</div></div>`;
+}
+function setConfigurationDisabled(disabled){[configBox,rampConfigBox].forEach(box=>box.querySelectorAll('button,input').forEach(control=>control.disabled=disabled))}
+async function loadConfiguration(){
+ try{
+  const x=await fetchJson('/api/config.json');savedConfiguration=x;
+  configBox.innerHTML=configDefinitions.filter(d=>!isRampSetting(d)).map(d=>renderConfigurationSetting(d,x)).join('');
+  rampConfigBox.innerHTML=configDefinitions.filter(isRampSetting).map(d=>renderConfigurationSetting(d,x,true)).join('');
+  renderSpinCurve();
+ }catch(e){
+  configBox.innerHTML=`<span class="error">Configuration load failed: ${e.message}</span>`;
+  rampConfigBox.innerHTML='';spinCurveStatus.className='error';
+  spinCurveStatus.textContent='Ramp graph could not load controller configuration.';
+ }
+}
+async function updateConfiguration(name,reset){
+ if(configBusy)return;
+ if(reset&&!confirm('Reset this setting to its firmware default?'))return;
+ const input=document.querySelector(`#cfg-${name}`),definition=configDefinitions.find(d=>d.key===name);
+ if(!reset&&configurationValue(name)===null){
+  configStatus.className='error';configStatus.textContent='Enter a finite value within the allowed range.';renderSpinCurve();return;
+ }
+ configBusy=true;setConfigurationDisabled(true);
+ configStatus.className='';configStatus.textContent=reset?'Resetting...':'Saving...';
+ try{
+  let url=`${reset?'/api/config/reset':'/api/config'}?name=${encodeURIComponent(name)}`;
+  if(!reset)url+=`&value=${encodeURIComponent(input.value)}`;
+  const result=await fetchJson(url,{method:'POST'});
+  savedConfiguration[name]=result.value;
+  input.value=configurationDisplayValue(definition,result.value);input.setAttribute('aria-invalid','false');
+  configStatus.className='success';configStatus.textContent=`${result.name} saved and verified as ${result.value}`;
+  renderSpinCurve();
+ }catch(e){configStatus.className='error';configStatus.textContent=e.message}
+ finally{configBusy=false;setConfigurationDisabled(false)}
+}
+async function refreshLive(){try{const x=await fetchJson('/api/live.json');live.innerHTML=card('WiFi',x.wifi_active?'active':'inactive')+card('AP / clients',`${x.ap_ready?'ready':'recovering'} / ${x.ap_clients}`)+card('AP restarts / start failures',`${x.ap_restarts} / ${x.ap_start_failures}`)+card('RC link / loss',`${x.rc_link?'ready':'lost'} / ${x.rc_loss_seconds.toFixed(1)} s`)+card('State',x.robot_state)+card('Before WiFi',x.last_operating_state)+card('Recording',x.recording)+card('Samples',x.stored_samples)+card('RPM / g',`${x.rpm} / ${x.g_force.toFixed(2)}`)+card('Battery',`${x.battery_volts.toFixed(2)} V`)+card('Raw CH1 / CH2 / throttle',`${x.ch1} / ${x.ch2} / ${x.throttle}`)+card('Logical spin request (%)',x.spin_request_percent)+card('Logical base / ceiling (%)',`${x.base_spin_command} / ${x.acceleration_ceiling}`)+card('Full-output throttle (%)',x.motor_full_scale_percent.toFixed(2))+card('Physical base (%)',x.physical_base_spin_command)+card('Physical output L / R (%)',`${x.left_dshot_average} / ${x.right_dshot_average}`)+card('Limiter / safety gate',`${x.acceleration_limiter_active?'ON':'off'} / ${x.safety_gate_closed?'CLOSED':'open'}`)+card('Free / min heap',`${x.free_heap} / ${x.minimum_free_heap}`);return true}catch(e){live.innerHTML=`<span class="error">Live update failed: ${e.message}</span>`;return false}}
 async function refreshSummary(){try{const x=await fetchJson('/api/summary.json');summary.textContent=JSON.stringify(x,null,2)}catch(e){summary.textContent=`Summary update failed: ${e.message}`}}
 async function loadRows(){try{const x=await fetchJson(`/api/timeline.json?start=${start}&count=${count}`);total=x.total;const only=document.querySelector('#melty').checked;rows.innerHTML=x.rows.filter(r=>!only||r.state==='MELTY').map(r=>`<tr><td>${r.time_s.toFixed(2)}</td><td>${r.state}</td><td>${r.rpm}</td><td>${r.g_force.toFixed(2)}</td><td>${r.battery_volts.toFixed(2)}</td><td>${r.ch1}</td><td>${r.ch2}</td><td>${r.throttle}</td><td>${r.spin_request_percent}</td><td>${r.base_spin_command}</td><td>${r.acceleration_ceiling}</td><td>${r.left_dshot_average}</td><td>${r.right_dshot_average}</td><td>${r.rpm_variation_ewma}</td><td>0x${r.flags.toString(16).padStart(2,'0')}</td></tr>`).join('');pageText.textContent=`${start}-${Math.min(start+count,total)} of ${total}`;document.querySelector('#prev').disabled=start===0;document.querySelector('#next').disabled=start+count>=total}catch(e){pageText.innerHTML=`<span class="error">Timeline failed: ${e.message}</span>`}}
 async function pollLive(){await refreshLive();setTimeout(pollLive,1000)}
 async function initializeDashboard(){await loadConfiguration();await refreshLive();await refreshSummary();await loadRows();setTimeout(pollLive,1000)}
-document.querySelector('#prev').onclick=()=>{start=Math.max(0,start-count);loadRows()};document.querySelector('#next').onclick=()=>{start+=count;loadRows()};document.querySelector('#melty').onchange=loadRows;setTimeout(initializeDashboard,500);
+[configBox,rampConfigBox].forEach(box=>box.addEventListener('input',renderSpinCurve));window.addEventListener('resize',renderSpinCurve);document.querySelector('#prev').onclick=()=>{start=Math.max(0,start-count);loadRows()};document.querySelector('#next').onclick=()=>{start+=count;loadRows()};document.querySelector('#melty').onchange=loadRows;setTimeout(initializeDashboard,500);
 </script></body></html>)__MELTYHTML__";
 
 uint64_t session_elapsed_ms()
@@ -75,15 +167,21 @@ int session_normalized_channel(int channel)
 
 int session_acceleration_ceiling(uint16_t sample_rpm)
 {
-  return constrain((int)lroundf((acc_rate * sample_rpm + 200.0f) / 10.0f),
+  return constrain((int)lroundf(spin_acceleration_ceiling(sample_rpm) / 10.0f),
                    0, 100);
 }
 
-bool session_acceleration_limiter_active(uint16_t sample_rpm,
-                                         int throttle_normalized)
+int session_spin_request_percent(float raw_throttle_percent)
 {
-  int spin_request_percent = constrain((throttle_normalized + 100) / 2, 0, 100);
-  return spin_request_percent > session_acceleration_ceiling(sample_rpm);
+  return constrain((int)lroundf(spin_requested_command(raw_throttle_percent) /
+                                9.99f), 0, 100);
+}
+
+bool session_acceleration_limiter_active(uint16_t sample_rpm,
+                                         float raw_throttle_percent)
+{
+  return spin_requested_command(raw_throttle_percent) >
+           spin_acceleration_ceiling(sample_rpm);
 }
 
 SessionState session_state_for_robot(RobotState state)
@@ -201,7 +299,7 @@ void session_capture_current_sample(bool missed)
     sample.flags |= SAMPLE_BATTERY_VALID;
   if(rc_status) sample.flags |= SAMPLE_RC_VALID;
   if(overflow) sample.flags |= SAMPLE_MISSED_OR_INVALID;
-  if(session_acceleration_limiter_active(sample.rpm, sample.throttle_normalized))
+  if(session_acceleration_limiter_active(sample.rpm, spin_throttle_input_percent))
     sample.flags |= SAMPLE_ACCEL_LIMITER_ACTIVE;
   if(!motor_output_gate_open()) sample.flags |= SAMPLE_MOTOR_SAFETY_GATE_CLOSED;
   if(translation_seen) sample.flags |= SAMPLE_TRANSLATION_PULSE_SEEN;
@@ -449,7 +547,8 @@ void session_handle_timeline_csv(bool melty_only)
     const TelemetrySample &sample = session_sample_at(i);
     if(melty_only && sample.state != SESSION_MELTY) continue;
     uint64_t sequence = session_sequence_at(i);
-    int spin_request = (sample.throttle_normalized + 100) / 2;
+    int spin_request = session_spin_request_percent(
+                         (sample.throttle_normalized + 100) * 0.5f);
     int row_length = snprintf(row, sizeof(row),
         "%.2f,%s,%u,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%u,0x%02X\n",
         sequence * SESSION_SAMPLE_INTERVAL_SECONDS,
@@ -476,11 +575,15 @@ void session_handle_timeline_csv(bool melty_only)
 
 void session_handle_live_json()
 {
-  char response[1600];
+  char response[1800];
   int throttle = session_normalized_channel(CH_SPIN_THROTTLE);
-  int base_command = (robot_state == ROBOT_SPINUP || robot_state == ROBOT_MELTY ||
-                      robot_state == ROBOT_CONFIG)
+  bool spin_state = robot_state == ROBOT_SPINUP || robot_state == ROBOT_MELTY ||
+                    robot_state == ROBOT_CONFIG;
+  int base_command = spin_state
                        ? constrain((int)lroundf(spinspeed / 9.99f), -100, 100) : 0;
+  int physical_base_command = spin_state
+                               ? session_scaled_motor_average(scale_motor_output(spinspeed, robot_state))
+                               : 0;
   SessionSummary view = session_recording_frozen
                           ? frozen_session_summary : session_summary_snapshot();
   uint32_t esp_minimum_heap = ESP.getMinFreeHeap();
@@ -497,6 +600,7 @@ void session_handle_live_json()
       "\"rc_loss_seconds\":%.2f,\"robot_state\":\"%s\",\"last_operating_state\":\"%s\"," 
       "\"rpm\":%d,\"g_force\":%.2f,\"battery_volts\":%.2f,\"ch1\":%d,\"ch2\":%d,"
       "\"throttle\":%d,\"spin_request_percent\":%d,\"base_spin_command\":%d,"
+      "\"motor_full_scale_percent\":%.3f,\"physical_base_spin_command\":%d,"
       "\"acceleration_ceiling\":%d,\"left_dshot_average\":%d,\"right_dshot_average\":%d,"
       "\"acceleration_limiter_active\":%s,\"safety_gate_closed\":%s,\"free_heap\":%u,"
       "\"minimum_free_heap\":%u,\"stored_samples\":%u,\"elapsed_seconds\":%.2f,"
@@ -511,10 +615,13 @@ void session_handle_live_json()
       session_state_name(session_state_for_robot(last_operating_state)),
       rpm, current_gforce, volts,
       session_normalized_channel(CH_TRANSLATE_LR),
-      session_normalized_channel(CH_TRANSLATE_FB), throttle, (throttle + 100) / 2,
-      base_command, session_acceleration_ceiling(constrain(rpm, 0, UINT16_MAX)),
+      session_normalized_channel(CH_TRANSLATE_FB), throttle,
+      session_spin_request_percent(spin_throttle_input_percent),
+      base_command, motor_full_scale_percent, physical_base_command,
+      session_acceleration_ceiling(constrain(rpm, 0, UINT16_MAX)),
       current_left_average, current_right_average,
-      session_acceleration_limiter_active(constrain(rpm, 0, UINT16_MAX), throttle)
+      session_acceleration_limiter_active(constrain(rpm, 0, UINT16_MAX),
+                                           spin_throttle_input_percent)
         ? "true" : "false",
       motor_output_gate_open() ? "false" : "true", ESP.getFreeHeap(),
       view.minimum_free_heap, session_sample_count, session_elapsed_ms() / 1000.0,
@@ -597,7 +704,8 @@ void session_handle_timeline_json()
         session_state_name(sample.state),
         sample.rpm, sample.g_centi_g / 100.0, sample.battery_centivolts / 100.0,
         sample.ch1_normalized, sample.ch2_normalized, sample.throttle_normalized,
-        (sample.throttle_normalized + 100) / 2, sample.base_spin_command,
+        session_spin_request_percent((sample.throttle_normalized + 100) * 0.5f),
+        sample.base_spin_command,
         session_acceleration_ceiling(sample.rpm), sample.left_dshot_average,
         sample.right_dshot_average, sample.rpm_variation, sample.flags);
     session_chunk_write(buffer, length);
@@ -660,6 +768,42 @@ bool drive_config_metadata(const String &name, float *&target,
     maximum_value = MAX_ACC_RATE;
     return true;
   }
+  if(name == "spin_ramp_start_rpm")
+  {
+    target = &spin_ramp_start_rpm;
+    nvs_key = "ramp_start_rpm";
+    default_value = DEFAULT_SPIN_RAMP_START_RPM;
+    minimum_value = MIN_SPIN_RAMP_START_RPM;
+    maximum_value = MAX_SPIN_RAMP_START_RPM;
+    return true;
+  }
+  if(name == "motor_full_scale_percent")
+  {
+    target = &motor_full_scale_percent;
+    nvs_key = "motor_full_pct";
+    default_value = DEFAULT_MOTOR_FULL_SCALE_PERCENT;
+    minimum_value = MIN_MOTOR_FULL_SCALE_PERCENT;
+    maximum_value = MAX_MOTOR_FULL_SCALE_PERCENT;
+    return true;
+  }
+  if(name == "top_led_phase_offset_deg")
+  {
+    target = &top_led_phase_offset_deg;
+    nvs_key = "top_led_trim";
+    default_value = DEFAULT_TOP_LED_PHASE_OFFSET_DEG;
+    minimum_value = MIN_LED_PHASE_OFFSET_DEG;
+    maximum_value = MAX_LED_PHASE_OFFSET_DEG;
+    return true;
+  }
+  if(name == "bottom_led_phase_offset_deg")
+  {
+    target = &bottom_led_phase_offset_deg;
+    nvs_key = "bot_led_trim";
+    default_value = DEFAULT_BOTTOM_LED_PHASE_OFFSET_DEG;
+    minimum_value = MIN_LED_PHASE_OFFSET_DEG;
+    maximum_value = MAX_LED_PHASE_OFFSET_DEG;
+    return true;
+  }
   return false;
 }
 
@@ -681,16 +825,33 @@ bool drive_config_request_safe()
 
 void session_send_config_json()
 {
-  char response[720];
+  char response[1600];
   snprintf(response, sizeof(response),
-      "{\"translation_scale_factor\":%.3f,\"percentdecel\":%.3f,\"acc_rate\":%.3f,"
-      "\"defaults\":{\"translation_scale_factor\":%.3f,\"percentdecel\":%.3f,\"acc_rate\":%.3f},"
+      "{\"translation_scale_factor\":%.3f,\"percentdecel\":%.3f,\"acc_rate\":%.6f,"
+      "\"spin_ramp_start_rpm\":%.6f,\"motor_full_scale_percent\":%.3f,"
+      "\"top_led_phase_offset_deg\":%.3f,\"bottom_led_phase_offset_deg\":%.3f,"
+      "\"defaults\":{\"translation_scale_factor\":%.3f,\"percentdecel\":%.3f,\"acc_rate\":%.6f,"
+      "\"spin_ramp_start_rpm\":%.6f,\"motor_full_scale_percent\":%.3f,"
+      "\"top_led_phase_offset_deg\":%.3f,\"bottom_led_phase_offset_deg\":%.3f},"
       "\"limits\":{\"translation_scale_factor\":[%.3f,%.3f],\"percentdecel\":[%.3f,%.3f],"
-      "\"acc_rate\":[%.3f,%.3f]}}",
-      translation_scale_factor, percentdecel, acc_rate,
+      "\"acc_rate\":[%.3f,%.3f],\"spin_ramp_start_rpm\":[%.3f,%.3f],"
+      "\"motor_full_scale_percent\":[%.3f,%.3f],"
+      "\"top_led_phase_offset_deg\":[%.3f,%.3f],"
+      "\"bottom_led_phase_offset_deg\":[%.3f,%.3f]},"
+      "\"spin_curve\":{\"floor_command\":%.3f,\"max_command\":999,\"exponent\":%.6f}}",
+      translation_scale_factor, percentdecel, acc_rate, spin_ramp_start_rpm,
+      motor_full_scale_percent,
+      top_led_phase_offset_deg, bottom_led_phase_offset_deg,
       DEFAULT_TRANSLATION_SCALE_FACTOR, DEFAULT_PERCENT_DECEL, DEFAULT_ACC_RATE,
+      DEFAULT_SPIN_RAMP_START_RPM, DEFAULT_MOTOR_FULL_SCALE_PERCENT,
+      DEFAULT_TOP_LED_PHASE_OFFSET_DEG, DEFAULT_BOTTOM_LED_PHASE_OFFSET_DEG,
       MIN_TRANSLATION_SCALE_FACTOR, MAX_TRANSLATION_SCALE_FACTOR,
-      MIN_PERCENT_DECEL, MAX_PERCENT_DECEL, MIN_ACC_RATE, MAX_ACC_RATE);
+      MIN_PERCENT_DECEL, MAX_PERCENT_DECEL, MIN_ACC_RATE, MAX_ACC_RATE,
+      MIN_SPIN_RAMP_START_RPM, MAX_SPIN_RAMP_START_RPM,
+      MIN_MOTOR_FULL_SCALE_PERCENT, MAX_MOTOR_FULL_SCALE_PERCENT,
+      MIN_LED_PHASE_OFFSET_DEG, MAX_LED_PHASE_OFFSET_DEG,
+      MIN_LED_PHASE_OFFSET_DEG, MAX_LED_PHASE_OFFSET_DEG,
+      SPIN_ACCEL_MIN_COMMAND, SPIN_ACCEL_EXPONENT);
   diagnostic_server.sendHeader("Cache-Control", "no-store");
   diagnostic_server.send(200, "application/json", response);
 }
@@ -761,7 +922,7 @@ void session_handle_config_update(bool reset_to_default)
 
   char response[240];
   snprintf(response, sizeof(response),
-           "{\"ok\":true,\"name\":\"%s\",\"value\":%.3f,\"default\":%.3f}",
+           "{\"ok\":true,\"name\":\"%s\",\"value\":%.6f,\"default\":%.6f}",
            name.c_str(), stored_value, default_value);
   diagnostic_server.sendHeader("Cache-Control", "no-store");
   diagnostic_server.send(200, "application/json", response);
